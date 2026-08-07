@@ -44,6 +44,15 @@ pub fn cache_path() -> PathBuf {
     PathBuf::from(home).join(".cache/memory-search/index-v1.json")
 }
 
+/// Model files live at an ABSOLUTE path. fastembed's default is
+/// `.fastembed_cache` under the CURRENT DIRECTORY, which made the server
+/// re-download 2.2 GB whenever launched from a different cwd — exactly what
+/// an MCP client does. That bug cost the first wire-up attempt.
+pub fn model_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join(".cache/memory-search/models")
+}
+
 /// Split one memory file into chunks: frontmatter description is prepended to
 /// the first chunk (it names the topic — retrieval quality depends on it),
 /// then split on `## ` headings, then oversized sections on blank lines.
@@ -153,7 +162,9 @@ impl Index {
     /// Build (or refresh) the index. Embeds only chunks missing from cache.
     pub fn build(store: &Path) -> Result<Self> {
         let mut model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(false),
+            InitOptions::new(EmbeddingModel::BGEM3)
+                .with_cache_dir(model_dir())
+                .with_show_download_progress(false),
         )?;
 
         let chunks = chunk_store(store)?;
