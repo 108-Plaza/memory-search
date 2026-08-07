@@ -28,11 +28,13 @@ DIRS=(
   "-Users-yongyutjantaboot-108-POS-livechat"
 )
 
-NEWER=()
-[ -f "$MARK" ] && NEWER=(-newer "$MARK")
+# macOS bash 3.2 + set -u: การขยาย array ว่างนับเป็น unbound — ใช้ string แทน
+NEWER=""
+[ -f "$MARK" ] && NEWER="-newer $MARK"
 
+# shellcheck disable=SC2086  # ตั้งใจไม่ quote $NEWER (ว่าง = ไม่มี filter)
 FILES=$(for d in "${DIRS[@]}"; do
-  find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' "${NEWER[@]}" -mmin +30 \
+  find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' $NEWER -mmin +30 \
     -size +200k -size -6M 2>/dev/null
 done | head -5)
 
