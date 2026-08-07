@@ -33,10 +33,11 @@ NEWER=""
 [ -f "$MARK" ] && NEWER="-newer $MARK"
 
 # shellcheck disable=SC2086  # ตั้งใจไม่ quote $NEWER (ว่าง = ไม่มี filter)
-FILES=$(for d in "${DIRS[@]}"; do
+# head ปิด pipe ก่อน find จบ → SIGPIPE + pipefail = exit 141; ครอบด้วย subshell+true
+FILES=$( { for d in "${DIRS[@]}"; do
   find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' $NEWER -mmin +30 \
     -size +200k -size -6M 2>/dev/null
-done | head -5)
+done; } | head -5 || true)
 
 if [ -z "$FILES" ]; then
   echo "ไม่มี transcript ใหม่ให้ขุด"
