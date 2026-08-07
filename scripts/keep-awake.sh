@@ -29,7 +29,9 @@ status() {
     | grep -E ' (sleep|displaysleep|disksleep) ' || true
   echo
   echo "=== wake ที่ตั้งไว้ ==="
-  pmset -g sched | grep -i 'repeat' || echo " (ไม่มี repeating wake)"
+  # ต้องเอาบรรทัดถัดจากหัวข้อด้วย — grep 'repeat' เฉย ๆ ได้แค่หัวข้อ ดูเหมือนว่างทั้งที่ตั้งแล้ว
+  pmset -g sched | awk '/Repeating power events:/{f=1;next} /Scheduled power events:/{f=0} f' \
+    | grep . || echo " (ไม่มี repeating wake)"
   echo
   echo "=== ตอนนี้มีอะไรกันเครื่องหลับอยู่ไหม ==="
   pmset -g assertions | grep -E 'PreventUserIdleSystemSleep|PreventSystemSleep' | head -5 || true
