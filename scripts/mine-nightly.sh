@@ -18,25 +18,45 @@ MARK="$DIR/.mine-watermark"
 OUT="$DIR/proposals"
 mkdir -p "$OUT"
 
-# launch dirs ของ pos108 (ตรงกับ symlink ในกองกลาง)
-DIRS=(
-  "-Users-yongyutjantaboot"
-  "-Users-yongyutjantaboot-108-POS"
-  "-Users-yongyutjantaboot-108-POS-admin"
-  "-Users-yongyutjantaboot-108-POS-core"
-  "-Users-yongyutjantaboot-108-POS-terminal"
-  "-Users-yongyutjantaboot-108-POS-livechat"
+# launch dirs ของ pos108 = ทุก dir ที่ขึ้นต้นด้วย -...-108-POS  +  home dir เปล่า ๆ
+#
+# ⚠️ เคยเป็นรายชื่อ hardcode 6 ตัว แล้ว "พลาดงานทั้งคืน" (2026-08-07): เซสชันที่รัน
+# จาก ~/108-POS/terminal/pos-installer ไปอยู่ dir `-108-POS-terminal-pos-installer`
+# ซึ่งไม่มีในรายชื่อ — เช่นเดียวกับ `-108-POS-memory-search` และ worktree ทุกตัว
+# (`-108-POS-core--claude-worktrees-*` ฯลฯ) รวมแล้วมองไม่เห็นไป 15 ไฟล์
+# แบบ prefix นี้ครอบ checkout/worktree ใหม่ที่จะเกิดขึ้นอีกโดยไม่ต้องมาแก้สคริปต์
+#
+# ที่ไม่รวมโดยตั้งใจ: -IdeaProjects* และ -108-Ting-Ecosystem* — คนละ memory store
+# (ดู memory `memory-store-unified`) prefix ข้างล่างกันสองอันนี้ออกอยู่แล้ว
+DIRS=()
+while IFS= read -r d; do DIRS+=("$(basename "$d")"); done < <(
+  find "$PROJ" -maxdepth 1 -type d \
+    \( -name '-Users-yongyutjantaboot-108-POS*' -o -name '-Users-yongyutjantaboot' \) \
+    2>/dev/null | sort
 )
+[ ${#DIRS[@]} -eq 0 ] && { echo "หา launch dir ไม่เจอเลย — ตรวจ \$PROJ" >&2; exit 1; }
 
 # macOS bash 3.2 + set -u: การขยาย array ว่างนับเป็น unbound — ใช้ string แทน
 NEWER=""
 [ -f "$MARK" ] && NEWER="-newer $MARK"
 
-# shellcheck disable=SC2086  # ตั้งใจไม่ quote $NEWER (ว่าง = ไม่มี filter)
+# ⚠️ ขนาดต้องเป็นหน่วย BYTE (`c`) ทั้งคู่ ห้ามผสม k กับ M
+# `find` บนเครื่องนี้คือ bfs 4.1.1 (ไม่ใช่ BSD find) และ `-size +200k -size -6M`
+# คืน **ศูนย์ผลลัพธ์เงียบ ๆ** ทั้งที่แต่ละอันแยกกันถูกต้อง — อ่านออกมาเป็น
+# "ไม่มี transcript ใหม่ให้ขุด" แทนที่จะเป็น error งานเลยเงียบไปทั้งคืน (2026-08-08)
+MIN_BYTES=204800     # 200 KB
+MAX_BYTES=6291456    # 6 MB
+
+# ปกติเว้น session ที่ยังเขียนอยู่ (แก้ไขภายใน 30 นาที) — `--now` ข้ามด่านนี้
+# สำหรับเทสต์ด้วยมือ ยอมขุด transcript ของ session ที่กำลังรันอยู่
+FRESH="-mmin +30"
+[ "${1:-}" = "--now" ] && FRESH=""
+
+# shellcheck disable=SC2086  # ตั้งใจไม่ quote $NEWER/$FRESH (ว่าง = ไม่มี filter)
 # head ปิด pipe ก่อน find จบ → SIGPIPE + pipefail = exit 141; ครอบด้วย subshell+true
 FILES=$( { for d in "${DIRS[@]}"; do
-  find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' $NEWER -mmin +30 \
-    -size +200k -size -6M 2>/dev/null
+  find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' $NEWER $FRESH \
+    -size +${MIN_BYTES}c -size -${MAX_BYTES}c 2>/dev/null
 done; } | head -5 || true)
 
 if [ -z "$FILES" ]; then
