@@ -23,7 +23,7 @@
 //! lookup must never be able to break the user's turn.
 
 use anyhow::{Context, Result};
-use memory_search::{Index, STORE};
+use memory_search::{Index, LinkGraph, STORE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -38,6 +38,11 @@ const MIN_SCORE: f32 = 0.55;
 const MIN_PROMPT_CHARS: usize = 12;
 
 const DEFAULT_K: usize = 3;
+
+/// Neighbours are one line each, but they are also the cheapest thing to
+/// over-produce — a well-linked hub can reach 20 files. Five is enough to name
+/// the ones a human would have thought of.
+const RELATED_LIMIT: usize = 5;
 
 fn socket_path() -> PathBuf {
     memory_search::cache_path()
@@ -83,9 +88,11 @@ fn serve() -> Result<()> {
 
     let t = std::time::Instant::now();
     let mut index = Index::build(std::path::Path::new(STORE)).context("building index")?;
+    let graph = LinkGraph::build(std::path::Path::new(STORE)).context("building link graph")?;
     eprintln!(
-        "memqd: {} chunks ready in {:?}",
+        "memqd: {} chunks, {} linked files ready in {:?}",
         index.chunks.len(),
+        graph.descriptions.len(),
         t.elapsed()
     );
 
@@ -103,14 +110,14 @@ fn serve() -> Result<()> {
                 continue;
             }
         };
-        if let Err(e) = handle(&mut stream, &mut index) {
+        if let Err(e) = handle(&mut stream, &mut index, &graph) {
             eprintln!("memqd: request failed: {e}");
         }
     }
     Ok(())
 }
 
-fn handle(stream: &mut UnixStream, index: &mut Index) -> Result<()> {
+fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let req: serde_json::Value = serde_json::from_str(line.trim())?;
@@ -119,6 +126,7 @@ fn handle(stream: &mut UnixStream, index: &mut Index) -> Result<()> {
 
     let hits = index.search(q, k)?;
     let mut out = String::new();
+    let mut matched: Vec<String> = Vec::new();
     for (score, c) in hits {
         if score < MIN_SCORE {
             continue;
@@ -131,7 +139,24 @@ fn handle(stream: &mut UnixStream, index: &mut Index) -> Result<()> {
         // Drop the synthetic context header the chunker prepends.
         let body = c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text);
         out.push_str(&format!("### {} — {heading} (score {score:.3})\n{body}\n\n", c.file));
+        if !matched.contains(&c.file) {
+            matched.push(c.file.clone());
+        }
     }
+
+    // One hop along the store's own links. Skipped when nothing scored — an
+    // off-topic prompt must stay silent, and neighbours of nothing are noise.
+    if !matched.is_empty() {
+        let related = graph.neighbours(&matched, RELATED_LIMIT);
+        if !related.is_empty() {
+            out.push_str("### Linked from the above (names only — read if relevant)\n");
+            for (name, desc) in related {
+                out.push_str(&format!("- `{name}` — {desc}\n"));
+            }
+            out.push('\n');
+        }
+    }
+
     stream.write_all(out.as_bytes())?;
     stream.flush()?;
     Ok(())

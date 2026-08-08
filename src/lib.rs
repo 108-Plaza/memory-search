@@ -152,6 +152,110 @@ pub fn chunk_store(store: &Path) -> Result<Vec<Chunk>> {
     Ok(chunks)
 }
 
+/// The `[[wikilink]]` graph the store has been carrying all along.
+///
+/// There are ~1000 links across these files and nothing traversed them: search
+/// ranked by embedding alone, so a hit never brought its own context with it.
+/// The links are hand-written by whoever wrote the memory — they encode "you
+/// will also need this", which is judgement no cosine score reproduces.
+///
+/// Only names + descriptions are surfaced, never neighbour bodies. A related
+/// file costs one line; pulling its content would cost more context than the
+/// hit itself and drown the thing actually asked about.
+pub struct LinkGraph {
+    /// file stem → frontmatter description (may be empty)
+    pub descriptions: HashMap<String, String>,
+    /// file stem → stems it links to
+    pub out: HashMap<String, Vec<String>>,
+    /// file stem → stems that link to it
+    pub back: HashMap<String, Vec<String>>,
+}
+
+impl LinkGraph {
+    pub fn build(store: &Path) -> Result<Self> {
+        let mut descriptions = HashMap::new();
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        let mut back: HashMap<String, Vec<String>> = HashMap::new();
+
+        for entry in std::fs::read_dir(store)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) if s != "MEMORY" => s.to_string(),
+                _ => continue,
+            };
+            let raw = std::fs::read_to_string(&path)?;
+
+            if let Some(d) = raw.lines().find_map(|l| l.trim().strip_prefix("description:")) {
+                descriptions.insert(
+                    stem.clone(),
+                    d.trim().trim_matches('"').to_string(),
+                );
+            }
+
+            // `[[name]]` — a dangling link is normal here (it marks a memory
+            // worth writing), so unresolved targets are simply skipped.
+            let mut targets: Vec<String> = Vec::new();
+            let mut rest = raw.as_str();
+            while let Some(open) = rest.find("[[") {
+                rest = &rest[open + 2..];
+                let Some(close) = rest.find("]]") else { break };
+                let target = rest[..close].trim().to_string();
+                rest = &rest[close + 2..];
+                if !target.is_empty() && target != stem && !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+            for t in &targets {
+                back.entry(t.clone()).or_default().push(stem.clone());
+            }
+            out.insert(stem, targets);
+        }
+        Ok(Self {
+            descriptions,
+            out,
+            back,
+        })
+    }
+
+    /// One hop out from the files that matched, in both directions. Returns
+    /// `(stem, description)` for neighbours that exist and are not themselves
+    /// results, most-connected first — a file reached from several hits is more
+    /// likely to be the shared context than one reached from a single hit.
+    pub fn neighbours(&self, seeds: &[String], limit: usize) -> Vec<(String, String)> {
+        let seed_stems: Vec<String> = seeds
+            .iter()
+            .map(|f| f.trim_end_matches(".md").to_string())
+            .collect();
+
+        let mut hits: HashMap<String, usize> = HashMap::new();
+        for s in &seed_stems {
+            let linked = self.out.get(s).into_iter().flatten();
+            let linking = self.back.get(s).into_iter().flatten();
+            for n in linked.chain(linking) {
+                if seed_stems.contains(n) || !self.descriptions.contains_key(n) {
+                    continue;
+                }
+                *hits.entry(n.clone()).or_default() += 1;
+            }
+        }
+
+        let mut ranked: Vec<(String, usize)> = hits.into_iter().collect();
+        // Count first, then name — ties must not reorder run to run.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        ranked
+            .into_iter()
+            .map(|(n, _)| {
+                let d = self.descriptions.get(&n).cloned().unwrap_or_default();
+                (n, d)
+            })
+            .collect()
+    }
+}
+
 pub struct Index {
     pub chunks: Vec<Chunk>,
     pub embeddings: Vec<Vec<f32>>,
