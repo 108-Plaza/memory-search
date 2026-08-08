@@ -37,6 +37,20 @@ const MIN_SCORE: f32 = 0.55;
 /// Embedding them returns whatever is nearest, which is worse than nothing.
 const MIN_PROMPT_CHARS: usize = 12;
 
+/// Required gap between the best score and the store's median score.
+///
+/// `MIN_SCORE` alone does not work, measured on the first live firing
+/// (2026-08-09): a pasted terminal transcript scored **0.605** against an
+/// unrelated file — above the cutoff, and inside the 0.574–0.726 band of real
+/// questions. What separates them is not height but *shape*. A real question
+/// peaks over the store (margin 0.144–0.303); text that is merely text sits
+/// near everything at once (that paste: **0.121**; small talk: 0.080).
+///
+/// 0.13 splits a genuinely narrow gap — the tightest true positive measured is
+/// 0.144 (a Thai receipt-encoding question) against that paste's 0.121. If real
+/// questions start being dropped, this is the first number to look at.
+const MIN_MARGIN: f32 = 0.13;
+
 const DEFAULT_K: usize = 3;
 
 /// Neighbours are one line each, but they are also the cheapest thing to
@@ -124,11 +138,16 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
     let q = req["q"].as_str().unwrap_or_default();
     let k = req["k"].as_u64().unwrap_or(DEFAULT_K as u64) as usize;
 
-    let hits = index.search(q, k)?;
+    let (hits, median) = index.search_scored(q, k)?;
     let mut out = String::new();
     let mut matched: Vec<String> = Vec::new();
+
+    // Flat distribution ⇒ the prompt is not *about* anything in the store.
+    // Judged on the best hit, so one strong match still carries weaker ones.
+    let peaked = hits.first().is_some_and(|(s, _)| *s - median >= MIN_MARGIN);
+
     for (score, c) in hits {
-        if score < MIN_SCORE {
+        if score < MIN_SCORE || !peaked {
             continue;
         }
         let heading = if c.heading.is_empty() {
@@ -201,6 +220,15 @@ fn hook() -> Result<()> {
 
     let trimmed = prompt.trim();
     if trimmed.chars().count() < MIN_PROMPT_CHARS || trimmed.starts_with('/') {
+        return Ok(());
+    }
+    // Pasted shell transcripts are the one input shape observed to beat the
+    // score cutoff (2026-08-09). The margin test catches them, but barely, so
+    // this names them outright: a `user@host … %` or `… $ ` line is a paste,
+    // and a real question essentially never contains one.
+    if trimmed.lines().any(|l| {
+        l.contains('@') && (l.contains("% ") || l.contains("$ "))
+    }) {
         return Ok(());
     }
 

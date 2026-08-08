@@ -311,6 +311,39 @@ impl Index {
         })
     }
 
+    /// Like [`Self::search`] but also returns the **median** score across the
+    /// whole store.
+    ///
+    /// An absolute cutoff cannot separate "asked about something we know" from
+    /// "text that is merely text". Measured 2026-08-09 on the first live hook
+    /// firing: a pasted terminal transcript scored 0.617–0.629 against three
+    /// unrelated files, inside the 0.599–0.661 band of genuine hits. The shape
+    /// differs even though the height does not — a real question has a *peak*
+    /// over the store, while generic text sits near everything at once. The
+    /// margin `top - median` measures that peak and is scale-free, so it does
+    /// not need re-tuning when the store grows.
+    pub fn search_scored(&mut self, query: &str, k: usize) -> Result<(Vec<(f32, &Chunk)>, f32)> {
+        let q = &self.model.embed(vec![query], None)?[0];
+        let qn: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut scored: Vec<(f32, &Chunk)> = self
+            .embeddings
+            .iter()
+            .zip(&self.chunks)
+            .map(|(e, c)| {
+                let dot: f32 = q.iter().zip(e).map(|(a, b)| a * b).sum();
+                let en: f32 = e.iter().map(|x| x * x).sum::<f32>().sqrt();
+                (dot / (qn * en), c)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let median = scored
+            .get(scored.len() / 2)
+            .map(|(s, _)| *s)
+            .unwrap_or_default();
+        scored.truncate(k);
+        Ok((scored, median))
+    }
+
     pub fn search(&mut self, query: &str, k: usize) -> Result<Vec<(f32, &Chunk)>> {
         let q = &self.model.embed(vec![query], None)?[0];
         let qn: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
