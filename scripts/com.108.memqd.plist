@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  memqd — the resident index behind the UserPromptSubmit hook.
+
+  This file is the source of truth; the live copy is at
+  ~/Library/LaunchAgents/com.108.memqd.plist. To install or update:
+
+      cp scripts/com.108.memqd.plist ~/Library/LaunchAgents/
+      launchctl bootout  gui/$UID/com.108.memqd 2>/dev/null
+      launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.108.memqd.plist
+
+  Why an agent at all: before this, the daemon was started by hand. It did not
+  survive a reboot, and `memq hook`'s fallback only spawns a replacement on the
+  *next* prompt — so the first prompt after every restart silently got no
+  memory. That is the exact failure the hook was built to remove.
+
+  KeepAlive restarts it if it dies or is killed. It does NOT need a file
+  watcher: the daemon re-stats the store on each request and reindexes itself
+  when a memory changes (see store_stamp() in src/bin/memq.rs).
+
+  Paths are absolute because launchd expands neither ~ nor $HOME.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.108.memqd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/yongyutjantaboot/108-POS/memory-search/target/release/memq</string>
+        <string>serve</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Index build is ~2.6 s; without a throttle a crash-loop would spin the
+         CPU rebuilding embeddings. 30 s is long enough to notice in the log. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/yongyutjantaboot/Library/Logs/memqd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yongyutjantaboot/Library/Logs/memqd.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/yongyutjantaboot/108-POS/memory-search</string>
+</dict>
+</plist>

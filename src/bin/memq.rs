@@ -93,6 +93,34 @@ fn main() -> Result<()> {
 
 // ---------------------------------------------------------------- daemon
 
+/// Newest mtime across the store's `*.md`, or `UNIX_EPOCH` if it cannot be read.
+///
+/// The daemon builds its index once, so before this existed a memory written
+/// after boot was invisible until someone remembered to restart it — which is
+/// the same failure the whole hook exists to remove. Two hub files written on
+/// 2026-08-09 were unsearchable for exactly that reason.
+///
+/// A directory watcher would not have caught it either: launchd's `WatchPaths`
+/// on a directory fires on add/remove/rename, **not** on an edit to a file
+/// already inside it — and editing an existing memory is the common case.
+/// Stat-ing the store is ~1 ms against a ~100 ms query, so it is cheap enough
+/// to do on every request.
+fn store_stamp() -> std::time::SystemTime {
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    let Ok(entries) = std::fs::read_dir(STORE) else {
+        return newest;
+    };
+    for e in entries.flatten() {
+        if e.path().extension().is_none_or(|x| x != "md") {
+            continue;
+        }
+        if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+            newest = newest.max(m);
+        }
+    }
+    newest
+}
+
 fn serve() -> Result<()> {
     let sock = socket_path();
     // A socket file left by a killed daemon would make every client hang on
@@ -101,8 +129,9 @@ fn serve() -> Result<()> {
     std::fs::create_dir_all(sock.parent().unwrap())?;
 
     let t = std::time::Instant::now();
+    let mut stamp = store_stamp();
     let mut index = Index::build(std::path::Path::new(STORE)).context("building index")?;
-    let graph = LinkGraph::build(std::path::Path::new(STORE)).context("building link graph")?;
+    let mut graph = LinkGraph::build(std::path::Path::new(STORE)).context("building link graph")?;
     eprintln!(
         "memqd: {} chunks, {} linked files ready in {:?}",
         index.chunks.len(),
@@ -124,6 +153,31 @@ fn serve() -> Result<()> {
                 continue;
             }
         };
+        // Pick up memories written since boot. Embeddings are cached on disk,
+        // so a rebuild that only adds a file or two costs far less than the
+        // cold ~2.6 s — and it happens a handful of times a day at most.
+        // A failed rebuild keeps serving the old index: stale beats silent.
+        let now = store_stamp();
+        if now > stamp {
+            let t = std::time::Instant::now();
+            match (
+                Index::build(std::path::Path::new(STORE)),
+                LinkGraph::build(std::path::Path::new(STORE)),
+            ) {
+                (Ok(i), Ok(g)) => {
+                    index = i;
+                    graph = g;
+                    stamp = now;
+                    eprintln!(
+                        "memqd: store changed — reindexed {} chunks in {:?}",
+                        index.chunks.len(),
+                        t.elapsed()
+                    );
+                }
+                _ => eprintln!("memqd: reindex failed, serving the previous index"),
+            }
+        }
+
         if let Err(e) = handle(&mut stream, &mut index, &graph) {
             eprintln!("memqd: request failed: {e}");
         }
@@ -157,7 +211,10 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
         };
         // Drop the synthetic context header the chunker prepends.
         let body = c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text);
-        out.push_str(&format!("### {} — {heading} (score {score:.3})\n{body}\n\n", c.file));
+        out.push_str(&format!(
+            "### {} — {heading} (score {score:.3})\n{body}\n\n",
+            c.file
+        ));
         if !matched.contains(&c.file) {
             matched.push(c.file.clone());
         }
@@ -226,9 +283,10 @@ fn hook() -> Result<()> {
     // score cutoff (2026-08-09). The margin test catches them, but barely, so
     // this names them outright: a `user@host … %` or `… $ ` line is a paste,
     // and a real question essentially never contains one.
-    if trimmed.lines().any(|l| {
-        l.contains('@') && (l.contains("% ") || l.contains("$ "))
-    }) {
+    if trimmed
+        .lines()
+        .any(|l| l.contains('@') && (l.contains("% ") || l.contains("$ ")))
+    {
         return Ok(());
     }
 
