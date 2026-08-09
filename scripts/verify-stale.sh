@@ -177,6 +177,148 @@ for f in $FILES; do
   fi
 done
 
+# ── 3-5. ความสอดคล้องของ "บรรทัดสรุป" กับตัวไฟล์ ────────────────────────────
+#
+# คลาสนี้เพิ่มเมื่อ 2026-08-09 หลังพลาดสองครั้งในงานเดียว ตอนย่อ 118 memory ลงเป็น hub:
+# ทั้งสองครั้งคือ **หยิบพาดหัวเดิมมาโดยไม่อ่านต่อ** — `pos108-kitchen-print-realtime`
+# ถูกยกเป็น "ร้านบนคลาวด์ไม่พิมพ์ = 🔴" ทั้งที่ในไฟล์มี ⛔ ของเจ้าของบอกว่าเป็นดีไซน์ที่ถูก
+# และ `pos108-core-ci-skips-all-crates-tests` ถูกยกเป็น "CI เชื่อไม่ได้" ทั้งที่ไฟล์เขียน
+# **FIXED** ไว้ตั้งแต่ PR #830 · เซสชันใหม่อ่านบรรทัดสรุปแล้วสรุปผิดตามทันที
+#
+# บรรทัดสรุปมีสองที่ และทั้งสองที่คือ *สิ่งที่ถูกอ่านก่อน* เนื้อไฟล์เสมอ:
+#   - `description:` ใน frontmatter — คือข้อความที่ `memory_search` คืนกลับมา
+#   - บรรทัดใน `*-hub.md` — คือสิ่งที่เซสชันเห็นก่อนตัดสินใจว่าจะเปิดไฟล์ไหม
+# ทั้งคู่ถูกเขียนตอนหนึ่ง แล้วไม่มีใครกลับมาแก้เมื่อเนื้อไฟล์เปลี่ยน
+#
+# ยังเป็นการตรวจด้วยเครื่องล้วน: ถามแค่ "ไฟล์ประกาศว่าจบแล้วหรือห้ามรายงานซ้ำไหม
+# และบรรทัดสรุปพูดตรงกันไหม" ไม่ได้ให้ใครตีความว่าเนื้อหาถูกหรือผิด
+python3 - "$STORE" "$REPORT" <<'PY' >> /dev/null
+import re, sys, glob, os
+store, report = sys.argv[1], sys.argv[2]
+
+# เครื่องหมาย "เรื่องนี้จบแล้ว"
+# LIVE/MERGED อยู่ในลิสต์ด้วย เพราะบรรทัดสรุปที่นี่มักเขียนว่า "✅ LIVE 2026-07-27" หรือ
+# "merged + ขึ้น staging แล้ว" ซึ่ง *บอกแล้ว* ว่าจบ — ถ้าไม่นับ จะไล่แจ้งซ้ำของที่เพิ่งแก้ไป
+# ⚠️ ฝั่งอังกฤษต้องมี \b ครอบ — ไม่งั้น `LIVE` ไปแมตช์กลางคำว่า "LIVES" ("WHERE IT LIVES
+# NOW") แล้วรายงานว่าไฟล์ประกาศจบแล้ว ทั้งที่มันกำลังบอกว่าย้ายบ้าน · ฝั่งไทยใช้ \b ไม่ได้
+# (ไม่มีช่องว่างคั่นคำ) จึงแยกเป็นสองก้อน · `MERGE` แยกจาก `MERGED` เพราะบรรทัดไทยเขียน
+# ว่า "merge แล้ว"
+DONE = (r'(?:\b(?:FIXED|RESOLVED|SUPERSEDED|SHIPPED|DEPLOYED|MERGED|MERGE|LIVE|CLOSED|DONE)\b'
+        r'|(?:แก้แล้ว|ขึ้นแล้ว|ขึ้น staging|ขึ้น prod|เสร็จแล้ว|ยกเลิกแล้ว|ไม่ใช่บั๊ก))')
+
+# ⚠️ ห้ามกวาดหา DONE ทั้งไฟล์ — ลองแล้วเมื่อ 2026-08-09 ได้ **90 finding จาก 6 ไฟล์
+# และเกือบทั้งหมดผิด**: memory ที่นี่ยาวและเล่าสถานะรายข้อ ("Slice 2 DONE",
+# "#4 DONE — PR #314 MERGED", "be **CLOSED**") ซึ่งเป็นสถานะของ *รายการย่อย*
+# ไม่ใช่ของทั้งไฟล์ · รายงานที่ผิดทั้งแผงแย่กว่าไม่มีรายงาน เพราะรอบสองไม่มีใครอ่าน
+# (บทเรียนเดียวกับตอน path check ผิด 17/17)
+#
+# สิ่งที่ตัดสินได้จริงคือ **บรรทัดแรกของเนื้อไฟล์** — ธรรมเนียมของสโตร์นี้คือขึ้นต้น
+# ด้วยสถานะของทั้งไฟล์เมื่อมันเปลี่ยน ("## ✅ FIXED", "⚠️ SUPERSEDED …")
+# ถ้าจะจับ "ทั้งไฟล์จบแล้วแต่ description ยังเล่าของเก่า" นี่คือสัญญาณเดียวที่ไม่เดา
+LEAD = re.compile(r'^\s*(?:#{1,4}\s+)?(?:[⚠️✅⛔🔴🟡🟠]\s*)*\*{0,2}\s*[^\n]{0,25}' + DONE)
+
+def lead_claim(body):
+    """สถานะที่ประกาศไว้ 'หัวไฟล์' — 3 บรรทัดแรกที่ไม่ว่างเท่านั้น"""
+    for ln in [l for l in body.splitlines() if l.strip()][:3]:
+        if LEAD.match(ln):
+            return ln.strip()
+    return None
+
+def parts(p):
+    t = open(p, encoding='utf-8').read()
+    m = re.match(r'^---\n(.*?)\n---\n(.*)$', t, re.S)
+    return (m.group(1), m.group(2)) if m else ('', t)
+
+def desc(front):
+    m = re.search(r'(?m)^description:\s*(.*)$', front)
+    return m.group(1).strip() if m else ''
+
+out, n = [], 0
+files = [f for f in sorted(glob.glob(os.path.join(store, '*.md')))
+         if not f.endswith(('MEMORY.md',)) and not f.endswith('-history.md')]
+
+# ── 3. description ตามเนื้อไฟล์ไม่ทัน ──────────────────────────────────────
+# hub ไม่เข้าเกณฑ์นี้: description ของมันบรรยาย *ดัชนี* ไม่ใช่คำกล่าวอ้างเรื่องใดเรื่องหนึ่ง
+for f in files:
+    if f.endswith('-hub.md'):
+        continue
+    front, body = parts(f)
+    d = desc(front)
+    if not d:
+        out.append(f"- 🟠 `{os.path.basename(f)}` — **ไม่มี `description:`** "
+                   f"⇒ `memory_search` ไม่มีอะไรสรุปให้คนอ่านก่อนเปิดไฟล์")
+        n += 1
+        continue
+    lead = lead_claim(body)
+    if lead and not re.search(DONE, d, re.I):
+        out.append(f"- 🟡 `{os.path.basename(f)}` — หัวไฟล์ประกาศว่าจบแล้ว แต่ `description:` "
+                   f"ไม่ได้บอก — **เทียบเอง** (นี่คือข้อความที่ `memory_search` คืนกลับมา)\n"
+                   f"  > ไฟล์: `{lead[:110]}`\n  > desc: `{d[:110]}`")
+        n += 1
+
+
+# ── 4. บรรทัดใน hub ขัดกับไฟล์ปลายทาง ──────────────────────────────────────
+hubs = sorted(glob.glob(os.path.join(store, '*-hub.md')))
+for h in hubs:
+    text = open(h, encoding='utf-8').read()
+    # ตัดเป็นก้อน bullet: เริ่มที่ "- " ไปจนถึง "- " ถัดไปหรือหัวข้อใหม่
+    blocks = re.split(r'(?m)^(?=- |#{1,4} )', text)
+    for b in blocks:
+        if not b.startswith('- '):
+            continue
+        for target in set(re.findall(r'\[\[([A-Za-z0-9._-]+)\]\]', b)):
+            tp = os.path.join(store, target + '.md')
+            # ลิงก์ hub→hub ไม่เข้าเกณฑ์: ⛔/สถานะที่อยู่ใน hub อีกตัวเป็นของ *บรรทัดในนั้น*
+            # ไม่ใช่ของบรรทัดที่ชี้มา (false positive จริงจากรอบแรก 2026-08-09)
+            if not os.path.exists(tp) or target.endswith('-hub'):
+                continue
+            _, tbody = parts(tp)
+            # 4a ไฟล์ปลายทางมี ⛔ (สิ่งที่เจ้าของสั่งว่าอย่ารายงานซ้ำ) แต่บรรทัด hub ไม่บอก
+            stop = re.search(r'(?m)^.{0,10}⛔[^\n]*', tbody)
+            if stop and '⛔' not in b:
+                out.append(f"- 🟠 `{os.path.basename(h)}` → `[[{target}]]` — ไฟล์ปลายทางมี ⛔ "
+                           f"แต่บรรทัด hub ไม่ได้บอก\n  > `{stop.group(0).strip()[:130]}`")
+                n += 1
+            # 4b ไฟล์ปลายทางประกาศว่าจบแล้ว แต่ bullet ยังเขียนเหมือนยังพังอยู่
+            else:
+                # 4b หัวไฟล์ปลายทางประกาศว่าจบแล้ว แต่ bullet ยังเขียนเหมือนยังพังอยู่
+                # (ใช้ lead_claim ด้วยเหตุผลเดียวกับ check 3 — ห้ามกวาดทั้งไฟล์)
+                lead = lead_claim(tbody)
+                if lead and not re.search(DONE, b, re.I):
+                    out.append(f"- 🟡 `{os.path.basename(h)}` → `[[{target}]]` — หัวไฟล์ปลายทาง"
+                               f"ประกาศว่าจบแล้ว แต่บรรทัด hub ไม่ได้บอก — **เทียบเอง**\n"
+                               f"  > ไฟล์: `{lead[:110]}`\n"
+                               f"  > hub: `{b.strip().splitlines()[0][:110]}`")
+                    n += 1
+
+# ── 5. ไฟล์ที่ไม่มีใครชี้ถึง — สาเหตุตรง ๆ ของการรื้อสร้างงานซ้ำ 2026-08-09 ────
+idx = open(os.path.join(store, 'MEMORY.md'), encoding='utf-8').read()
+reach = set(re.findall(r'\]\(([A-Za-z0-9._-]+)\.md\)', idx))
+for h in hubs:
+    reach |= set(re.findall(r'\[\[([A-Za-z0-9._-]+)\]\]', open(h, encoding='utf-8').read()))
+    reach.add(os.path.basename(h)[:-3])
+orphan = sorted(os.path.basename(f)[:-3] for f in files if os.path.basename(f)[:-3] not in reach)
+for o in orphan:
+    out.append(f"- 🔴 `{o}.md` — **ไม่มีบรรทัดใน MEMORY.md และไม่มี hub ไหนชี้ถึง** "
+               f"(เซสชันที่ไม่ได้ยิงค้นจะไม่มีทางรู้ว่ามีไฟล์นี้)")
+    n += 1
+
+with open(report, 'a', encoding='utf-8') as fh:
+    fh.write("\n## บรรทัดสรุป (description / hub) และไฟล์กำพร้า\n\n")
+    fh.write(("\n".join(out) if out else
+              f"ตรวจ {len(files)} ไฟล์ + hub {len(hubs)} ตัว — description ตรงกับเนื้อไฟล์ "
+              "ทุกตัว, บรรทัด hub ไม่ขัดกับปลายทาง, ไม่มีไฟล์กำพร้า") + "\n")
+print(n)
+PY
+SUMMARY_FINDINGS=$(python3 - "$REPORT" <<'PY'
+import re,sys
+t=open(sys.argv[1],encoding='utf-8').read()
+sec=t.split('## บรรทัดสรุป (description / hub) และไฟล์กำพร้า',1)
+print(len(re.findall(r'(?m)^- [🔴🟡🟠]', sec[1])) if len(sec)>1 else 0)
+PY
+)
+FINDINGS=$((FINDINGS + SUMMARY_FINDINGS))
+
 {
   echo "---"
   echo
@@ -184,9 +326,10 @@ done
   echo
   echo "| | |"
   echo "|---|--:|"
-  echo "| ไฟล์ที่ตรวจ | $N |"
+  echo "| ไฟล์ที่ตรวจ (PR/path) | $N |"
   echo "| PR ที่ยืนยันกับ GitHub | $CHECKED_PR |"
   echo "| path ที่เช็คการมีอยู่ | $CHECKED_PATH |"
+  echo "| description + hub + กำพร้า (ตรวจทั้งสโตร์) | $SUMMARY_FINDINGS |"
   echo "| **เรื่องที่ต้องดู** | **$FINDINGS** |"
   echo
   if [ "$FINDINGS" -eq 0 ]; then
