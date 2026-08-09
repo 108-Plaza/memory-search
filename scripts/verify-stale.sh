@@ -57,10 +57,27 @@ trap 'rm -f "$TRACKED"' EXIT
 # ขึ้นต้นด้วย `crates/` เหมือนรีโปเรา จึงหลุดด่าน prefix ไปโดนตัดสินว่า "ไม่มีในรีโปไหน"
 # (false positive จริงตอนกวาดทั้งสโตร์ 2026-08-09: crates/api/api_utils/src/{provision,utils}.rs
 #  มีอยู่ครบใน ~/IdeaProjects/api-108jobs)
+# ⚠️ ต้องรวม **ทั้งเช็คเอาต์และ default branch ของ origin** — `git ls-files` อ่านจาก
+# working tree ซึ่งเป็นบรานช์/คอมมิตอะไรก็ได้ที่คนทิ้งไว้ · เช็คเอาต์ `core/` ตามหลัง
+# origin/main อยู่ 18 คอมมิตตอนกวาดทั้งสโตร์ 2026-08-09 ทำให้ไฟล์ที่ PR #837 เพิ่งเพิ่ม
+# (`crates/pos-printing/src/domain/entities/printer.rs`, `printing/printers.rs`) ถูกรายงาน
+# ว่า "ไม่มีอยู่ในรีโปไหนแล้ว" ทั้งที่อยู่บน main ครบ — เป็นกับดักเดียวกับ
+# memory `root-checkout-files-are-stale` · union กันไว้ ปลอดภัยกว่าเลือกข้างใดข้างหนึ่ง
+# (ของที่ยังอยู่แค่ในบรานช์ที่ทำงานอยู่ก็ไม่ถูกแจ้งผิด)
 for d in "$WS"/*/ "$HOME"/IdeaProjects/*/; do
   [ -d "$d/.git" ] || continue
-  ( cd "$d" && git ls-files 2>/dev/null | sed "s|^|$(basename "$d")/|" )
-done > "$TRACKED"
+  name=$(basename "$d")
+  (
+    cd "$d" || exit 0
+    git ls-files 2>/dev/null
+    # default branch ของแต่ละ repo ไม่เหมือนกัน (terminal ใช้ master)
+    ref=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+    [ -z "$ref" ] && for c in origin/main origin/master; do
+      git rev-parse -q --verify "$c" >/dev/null 2>&1 && { ref=$c; break; }
+    done
+    [ -n "$ref" ] && git ls-tree -r --name-only "$ref" 2>/dev/null
+  ) | sed "s|^|$name/|"
+done | sort -u > "$TRACKED"
 REPOS=$(awk -F/ '{print $1}' "$TRACKED" | sort -u | wc -l | tr -d ' ')
 [ ! -s "$TRACKED" ] && { echo "อ่านรายชื่อไฟล์จากรีโปไม่ได้เลย — ยกเลิก" >&2; exit 1; }
 
@@ -183,6 +200,20 @@ for f in $FILES; do
       *)
         grep -q "^${rel%%/*}/" "$TRACKED" || continue ;;
     esac
+    # ⚠️ ถ้าบรรทัดนั้น *บอกอยู่แล้ว* ว่าไฟล์ถูกลบ/ย้าย ก็ไม่ใช่ความเพี้ยน — มันคือ
+    # ประวัติที่เขียนไว้ถูกต้อง `pos108-terminal-platform` เขียนว่า "`src/printer.rs`
+    # … were **deleted** (PR #40; verified absent 2026-08-07)" แล้วยังโดนแจ้งว่า
+    # "ไม่มีอยู่ในรีโปไหนแล้ว" ทุกคืน · และหลังแก้ memory ให้บอกที่อยู่ใหม่ (A → B)
+    # ตัว A ก็จะโดนแจ้งซ้ำตลอดไป ทั้งที่นั่นคือผลลัพธ์ที่เราต้องการ
+    # (พบตอนกวาดทั้งสโตร์ 2026-08-09: 7 ใน 8 finding ที่เหลือเป็นคลาสนี้ล้วน)
+    # ดูรอบ ๆ ±3 บรรทัด ไม่ใช่บรรทัดเดียว — memory ที่นี่ตัดบรรทัดราว 90 ตัวอักษร
+    # คำอธิบายว่า "ถูกลบแล้ว" จึงมักไปตกอยู่บรรทัดถัดไป (ทั้งสามเคสที่เหลือหลังรอบแรก
+    # ของ guard นี้เป็นแบบนั้นหมด) · รายการคำต้องแคบกว่าตอนเช็คบรรทัดเดียว: `was`
+    # กับ `เคย` เจอได้ทั่วไปในหน้าต่าง 7 บรรทัด จะกลบ finding จริงทิ้ง
+    ctx=$(grep -F -B3 -A3 -- "$rel" "$f")
+    if echo "$ctx" | grep -qiE 'deleted|removed|renamed|no longer|gone|absent|mov(ed|ing)|now lives|now at|ถูกลบ|ย้าย|เลื่อน|เดิมคือ|ไม่มีแล้ว'; then
+      continue
+    fi
     CHECKED_PATH=$((CHECKED_PATH+1))
 
     if ! grep -qxF "$rel" "$TRACKED" && ! grep -qF "/$rel" "$TRACKED"; then
