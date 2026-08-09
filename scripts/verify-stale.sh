@@ -52,7 +52,12 @@ FILES=$(echo "$ALL" | awk -v o="$OFFSET" -v n="$N" -v t="$TOTAL" \
 # เร็วกว่าและแม่นกว่าการไล่ `test -e` ทีละ base ที่เลือกมาเอง (รอบแรกพลาดเพราะแบบนั้น)
 TRACKED=$(mktemp)
 trap 'rm -f "$TRACKED"' EXIT
-for d in "$WS"/*/; do
+# ⚠️ ต้องรวม ~/IdeaProjects ด้วย ไม่ใช่แค่ ~/108-POS — สโตร์นี้จำเรื่อง api-108jobs /
+# 108jobs-flutter / Payment-Platform ซึ่ง **ไม่ได้อยู่ใน workspace นี้** และ path ของมัน
+# ขึ้นต้นด้วย `crates/` เหมือนรีโปเรา จึงหลุดด่าน prefix ไปโดนตัดสินว่า "ไม่มีในรีโปไหน"
+# (false positive จริงตอนกวาดทั้งสโตร์ 2026-08-09: crates/api/api_utils/src/{provision,utils}.rs
+#  มีอยู่ครบใน ~/IdeaProjects/api-108jobs)
+for d in "$WS"/*/ "$HOME"/IdeaProjects/*/; do
   [ -d "$d/.git" ] || continue
   ( cd "$d" && git ls-files 2>/dev/null | sed "s|^|$(basename "$d")/|" )
 done > "$TRACKED"
@@ -87,18 +92,36 @@ for f in $FILES; do
     state=$(gh pr view "$num" --repo "$repo" --json state,mergedAt --jq .state 2>/dev/null)
     [ -z "$state" ] && continue
 
-    # หาบรรทัดที่อ้าง PR นี้ ไว้เทียบกับสิ่งที่ไฟล์อ้าง
-    line=$(grep -m1 -- "#$num" "$f" | sed 's/^[[:space:]]*//' | cut -c1-160)
-    claims_merged=$(echo "$line" | grep -ciE 'merged|merge|deployed|deploy|PROD|ขึ้นแล้ว|ครบแล้ว')
-    claims_open=$(echo "$line" | grep -ciE 'OPEN|ค้าง|ยังไม่|รอ|pending|draft')
+    # ทุกบรรทัดที่อ้าง PR นี้ ไม่ใช่แค่บรรทัดแรก — บรรทัดแรกมักเป็นการเกริ่น
+    # ส่วนบรรทัดที่ *อ้างสถานะ* อยู่ถัดลงไป (จับผิดเป็น #412 ตอนกวาดทั้งสโตร์)
+    lines=$(grep -- "#$num" "$f" | sed 's/^[[:space:]]*//')
+    claims_merged=$(echo "$lines" | grep -ciE 'merged|merge|deployed|deploy|PROD|ขึ้นแล้ว|ครบแล้ว')
+    # ⚠️ `OPEN` ต้องเป็นตัวใหญ่ทั้งคำ — สโตร์นี้เขียนสถานะเป็น "PR #335 to main OPEN"
+    # ส่วนตัวเล็กเกือบทุกครั้งเป็น *คำธรรมดา*: "open-drawer" (ชื่อฟีเจอร์),
+    # "forced open change form", "opened 2026-07-08" (เล่าว่าเปิด PR เมื่อไหร่)
+    # ทั้งสามแบบเคยถูกนับเป็น "ยังค้าง" ตอนกวาดทั้งสโตร์ 2026-08-09
+    # ฝั่งไทยก็ต้องเป็นวลี ไม่ใช่ `รอ` เดี่ยว ๆ (ไปโดน "รอบ", "รอง")
+    claims_open=$(echo "$lines" | grep -cE '\bOPEN\b|\bPENDING\b|\bDRAFT\b|ยังไม่|ยังค้าง|รออยู่|ค้างอยู่')
+    # บรรทัดที่ยกมาโชว์ = บรรทัดที่อ้างสถานะจริง ถ้าไม่มีค่อยใช้บรรทัดแรก
+    line=$(echo "$lines" | grep -m1 -E '\bOPEN\b|\bPENDING\b|\bDRAFT\b|ยังไม่|ยังค้าง|รออยู่|ค้างอยู่|merged|MERGED|deployed')
+    [ -z "$line" ] && line=$(echo "$lines" | head -1)
+    line=$(echo "$line" | cut -c1-160)
 
     # เล่าอดีตไม่ใช่การอ้างสถานะปัจจุบัน — "the fix **was open** as core PR #833" คือการ
     # เล่าว่าตอนนั้นมันยังไม่ merge ไม่ได้แปลว่าไฟล์เข้าใจผิดว่าตอนนี้ยังค้าง
     # (false positive จริงจากรอบ 2026-08-09 03:10)
-    echo "$line" | grep -qiE 'was |were |had been|used to|at the time|เคย|ตอนนั้น|ก่อนหน้า' \
+    echo "$line" | grep -qiE 'was |were |had been|used to|opened |at the time|เคย|ตอนนั้น|ก่อนหน้า' \
       && claims_open=0
 
-    if [ "$state" != "MERGED" ] && [ "$claims_merged" -gt 0 ] && [ "$claims_open" -eq 0 ]; then
+    # ถ้าไฟล์เอ่ยสถานะจริงของ PR ไว้แล้ว = มันตรงกับ GitHub อยู่ ห้ามแจ้ง
+    # เคสจริง: "PR #15 **was closed** and its content **rebased + merged as #25**"
+    # คำว่า merged ในนั้นหมายถึง #25 ไม่ใช่ #15 — ไฟล์ถูกทุกอย่าง แต่โดนแจ้งว่าผิด
+    # (false positive จากการที่เราขยายไปอ่านทุกบรรทัดที่เอ่ยเลขนั้น)
+    agrees=$(echo "$lines" | grep -ci -- "$state")
+
+    if [ "$agrees" -gt 0 ]; then
+      :
+    elif [ "$state" != "MERGED" ] && [ "$claims_merged" -gt 0 ] && [ "$claims_open" -eq 0 ]; then
       body="$body
 - 🔴 **$repo#$num ยัง \`$state\`** แต่ไฟล์เขียนเหมือน merged แล้ว
   > \`$line\`"
@@ -125,8 +148,12 @@ for f in $FILES; do
         fi
       fi
     fi
+  # `.*` แบบ greedy = เอา keyword **ตัวที่ใกล้ที่สุด** ก่อนเลข ไม่ใช่ตัวแรก
+  # บรรทัด "core sha-598e25c; PRs admin #333 + core #572" เคยถูกอ่านเป็น core#333
+  # (คนละ PR กันคนละเรื่อง) เพราะ sed เดิมหยิบ keyword ตัวแรกของ match
   done < <(grep -oiE '(core|admin|terminal|orders|store|sell|media|platform-services)[^#]{0,40}#[0-9]{2,4}' "$f" \
-           | sed -E 's/^([A-Za-z-]+).*#([0-9]+)$/\1|\2/' | tr 'A-Z' 'a-z' | sort -u)
+           | sed -E 's/.*(core|admin|terminal|orders|store|sell|media|platform-services)([^#]{0,40})#([0-9]+)$/\1|\3/I' \
+           | tr 'A-Z' 'a-z' | sort -u)
 
   # ── 2. path ที่อ้างถึงใน backtick — ยังมีอยู่จริงไหม ────────────────────────
   #
