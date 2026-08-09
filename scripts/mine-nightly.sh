@@ -85,7 +85,18 @@ PROMPT="คุณคือ memory miner ของ pos108. อ่านบทส�
 เขียนผลด้วย Write ลงไฟล์ $OUT/$STAMP.md รูปแบบ: ## NEW (ต่อ fact: ชื่อไฟล์ kebab-case ที่เสนอ + เนื้อ 1-3 ประโยค self-contained + หลักฐาน) / ## UPDATES (ไฟล์เดิม + เพิ่มอะไร) / ## STATS (candidate/dup/new)
 จบด้วยข้อความสั้น ๆ ว่าเขียนไฟล์แล้ว"
 
+# โมเดล: ตั้งใจใช้ Sonnet ไม่ใช่ค่า default (= Opus ตามเซสชันที่เรียก) — งานนี้คือ
+# extraction + ตัดสินว่าซ้ำไหม ซึ่ง Sonnet 5 ทำได้ใกล้ Opus ในสายนี้ และมันรัน **ทุกคืน**
+# บน transcript ได้ถึง 5 ไฟล์ ไฟล์ละ 0.2–6 MB จึงเป็นจุดที่กินโทเคนซ้ำ ๆ มากที่สุด
+#
+# ⚠️ ห้ามลดไป Haiku โดยไม่วัด — ด่านที่ยากของ miner ไม่ใช่การ *อ่าน* แต่คือการ **ตัดสินว่า
+# fact ไหนซ้ำของเดิม** (dedup rate 62–72% ในรอบที่ผ่านมา) ถ้าด่านนั้นอ่อนลง proposal จะ
+# ท่วมด้วยของซ้ำ แล้วเจ้าของจะเลิกอ่าน — ซึ่งแพงกว่าค่าโทเคนที่ประหยัดได้มาก
+# วัดก่อนเปลี่ยน: เทียบ STATS (dedup / NEW / UPDATES) กับรอบก่อนหน้า
+MODEL="${MINER_MODEL:-sonnet}"
+
 claude -p "$PROMPT" \
+  --model "$MODEL" \
   --allowedTools "Read,Write,mcp__memory-search__memory_search" \
   --max-turns 40 2>&1 | tail -3
 
