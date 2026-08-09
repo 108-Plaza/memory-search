@@ -92,6 +92,12 @@ for f in $FILES; do
     claims_merged=$(echo "$line" | grep -ciE 'merged|merge|deployed|deploy|PROD|ขึ้นแล้ว|ครบแล้ว')
     claims_open=$(echo "$line" | grep -ciE 'OPEN|ค้าง|ยังไม่|รอ|pending|draft')
 
+    # เล่าอดีตไม่ใช่การอ้างสถานะปัจจุบัน — "the fix **was open** as core PR #833" คือการ
+    # เล่าว่าตอนนั้นมันยังไม่ merge ไม่ได้แปลว่าไฟล์เข้าใจผิดว่าตอนนี้ยังค้าง
+    # (false positive จริงจากรอบ 2026-08-09 03:10)
+    echo "$line" | grep -qiE 'was |were |had been|used to|at the time|เคย|ตอนนั้น|ก่อนหน้า' \
+      && claims_open=0
+
     if [ "$state" != "MERGED" ] && [ "$claims_merged" -gt 0 ] && [ "$claims_open" -eq 0 ]; then
       body="$body
 - 🔴 **$repo#$num ยัง \`$state\`** แต่ไฟล์เขียนเหมือน merged แล้ว
