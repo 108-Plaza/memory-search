@@ -51,6 +51,13 @@ either output path. Baseline at 278 files / 1372 chunks: recall 7/12 at k=3 and
 9/12 at k=5 on both paths, ~28 ms median, one known false positive on the hook
 (a paragraph of business prose that genuinely resembles the store).
 
+`scripts/soak.py N` answers a different question — does memqd's RSS keep
+growing? Measured over 10,000 queries: 1815 MB fresh, +144 MB in the first
+quarter of the run, **+1 MB in the last**, flat at ~1983 MB. An ONNX arena
+sizing itself to the largest input it has seen, not a leak; plan ~2 GB. Its
+latency column is not the system's latency — it fires as fast as one client can
+(13 q/s, p50 80 ms) and nothing real does that.
+
 ## memqd — automatic retrieval (the `UserPromptSubmit` hook)
 
 `memq hook` injects the top hits into every prompt; `memq serve` is the resident
