@@ -23,7 +23,7 @@
 //! lookup must never be able to break the user's turn.
 
 use anyhow::{Context, Result};
-use memory_search::{Index, LinkGraph, STORE};
+use memory_search::{store_stamp, Index, LinkGraph, STORE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -93,33 +93,12 @@ fn main() -> Result<()> {
 
 // ---------------------------------------------------------------- daemon
 
-/// Newest mtime across the store's `*.md`, or `UNIX_EPOCH` if it cannot be read.
-///
-/// The daemon builds its index once, so before this existed a memory written
-/// after boot was invisible until someone remembered to restart it — which is
-/// the same failure the whole hook exists to remove. Two hub files written on
-/// 2026-08-09 were unsearchable for exactly that reason.
-///
-/// A directory watcher would not have caught it either: launchd's `WatchPaths`
-/// on a directory fires on add/remove/rename, **not** on an edit to a file
-/// already inside it — and editing an existing memory is the common case.
-/// Stat-ing the store is ~1 ms against a ~100 ms query, so it is cheap enough
-/// to do on every request.
-fn store_stamp() -> std::time::SystemTime {
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    let Ok(entries) = std::fs::read_dir(STORE) else {
-        return newest;
-    };
-    for e in entries.flatten() {
-        if e.path().extension().is_none_or(|x| x != "md") {
-            continue;
-        }
-        if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
-            newest = newest.max(m);
-        }
-    }
-    newest
-}
+// Freshness lives in `memory_search::store_stamp` — the MCP server re-stats the
+// same way. The daemon builds its index once, so before that existed a memory
+// written after boot was invisible until someone remembered to restart it,
+// which is the same failure the whole hook exists to remove. Two hub files
+// written on 2026-08-09 were unsearchable for exactly that reason.
+// Stat-ing the store is ~1 ms against a ~30 ms query — cheap per request.
 
 fn serve() -> Result<()> {
     let sock = socket_path();
@@ -153,19 +132,18 @@ fn serve() -> Result<()> {
                 continue;
             }
         };
-        // Pick up memories written since boot. Embeddings are cached on disk,
-        // so a rebuild that only adds a file or two costs far less than the
-        // cold ~2.6 s — and it happens a handful of times a day at most.
+        // Pick up memories written since boot. `refresh` re-embeds only what
+        // changed INTO the loaded model — a second `Index::build` here would
+        // reload BGE-M3 every time (~1 s and ~200 MB of churn) for nothing.
         // A failed rebuild keeps serving the old index: stale beats silent.
         let now = store_stamp();
         if now > stamp {
             let t = std::time::Instant::now();
             match (
-                Index::build(std::path::Path::new(STORE)),
+                index.refresh(std::path::Path::new(STORE)),
                 LinkGraph::build(std::path::Path::new(STORE)),
             ) {
-                (Ok(i), Ok(g)) => {
-                    index = i;
+                (Ok(()), Ok(g)) => {
                     graph = g;
                     stamp = now;
                     eprintln!(

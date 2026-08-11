@@ -1,17 +1,21 @@
 # memory-search
 
 Semantic search MCP server over the pos108 shared memory store
-(`~/.claude/shared-memory/pos108`, 229 files, Thai+English).
+(`~/.claude/shared-memory/pos108`, ~280 files, Thai+English).
 
 - Model: **BGE-M3** via fastembed/ONNX, fully local. Chosen by measurement:
   6/6 on a Thai↔English retrieval spike where multilingual-e5-small scored 2/6
   (`src/bin/spike.rs` — rerun it before swapping models).
-- No vector DB: ~1.1k chunks × 1024 dims brute-forced in ~25 ms/query.
+- No vector DB: ~1.4k chunks × 1024 dims brute-forced in ~28 ms/query.
 - Embedding cache keyed by chunk content hash at
   `~/.cache/memory-search/index-v1.json` — first index ~8 min, unchanged boot ~1 s.
 - The markdown store stays the source of truth; this crate only reads it.
-  The MCP server indexes once at startup. The `memq` daemon re-stats the store
-  per request and reindexes when a memory changes (see below).
+  **Both** entry points re-stat the store before serving (`store_stamp`) and
+  refresh when a memory is written, deleted or renamed, so a memory written
+  mid-session is searchable on the next query — ~70 ms, and free when nothing
+  changed. Refreshing reuses the loaded model (`Index::refresh`); a second
+  `Index::build` would reload BGE-M3 each time, which is what made a reindex
+  cost ~1 s and ~200 MB of churn until 2026-08-11.
 
 ## Build & wire up
 

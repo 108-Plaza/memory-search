@@ -20,6 +20,34 @@ use std::path::{Path, PathBuf};
 
 pub const STORE: &str = "/Users/yongyutjantaboot/.claude/shared-memory/pos108";
 
+/// Newest mtime among the store's `*.md` **and the directory itself**. Both the
+/// daemon and the MCP server re-stat before serving and rebuild when this moves.
+///
+/// Both halves are load-bearing, and each covers the other's blind spot:
+/// - the directory's mtime moves on add/remove/rename but NOT on an edit to a
+///   file already inside it — and editing an existing memory is the common case
+///   (this is also why launchd `WatchPaths` on the store would not work);
+/// - the files' mtimes miss a **deletion** entirely, since removing one does not
+///   touch the survivors. Measured 2026-08-11: a probe file stayed searchable
+///   after `rm` until some unrelated memory happened to be edited.
+pub fn store_stamp() -> std::time::SystemTime {
+    let mut newest = std::fs::metadata(STORE)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(STORE) else {
+        return newest;
+    };
+    for e in entries.flatten() {
+        if e.path().extension().is_none_or(|x| x != "md") {
+            continue;
+        }
+        if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+            newest = newest.max(m);
+        }
+    }
+    newest
+}
+
 /// Max chunk size in bytes. Sections larger than this are split on paragraph
 /// boundaries. BGE-M3 truncates internally past its token limit; keeping
 /// chunks this size keeps every byte inside the window with margin.
@@ -263,14 +291,37 @@ pub struct Index {
 }
 
 impl Index {
-    /// Build (or refresh) the index. Embeds only chunks missing from cache.
+    /// Build the index from scratch, loading the model. Embeds only chunks
+    /// missing from cache. Use [`Self::refresh`] to pick up later writes — a
+    /// second `build` reloads BGE-M3 (~1 s, ~200 MB of churn) for nothing.
     pub fn build(store: &Path) -> Result<Self> {
         let mut model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::BGEM3)
                 .with_cache_dir(model_dir())
                 .with_show_download_progress(false),
         )?;
+        let (chunks, embeddings) = Self::load(&mut model, store)?;
+        Ok(Self {
+            chunks,
+            embeddings,
+            model,
+        })
+    }
 
+    /// Re-read the store into the ALREADY-LOADED model. Cheap when nothing
+    /// changed (every chunk hits the cache) and the only cost when a memory was
+    /// written is embedding that file's chunks.
+    ///
+    /// On failure the index is left untouched — a caller that keeps serving the
+    /// previous one is right: stale beats silent.
+    pub fn refresh(&mut self, store: &Path) -> Result<()> {
+        let (chunks, embeddings) = Self::load(&mut self.model, store)?;
+        self.chunks = chunks;
+        self.embeddings = embeddings;
+        Ok(())
+    }
+
+    fn load(model: &mut TextEmbedding, store: &Path) -> Result<(Vec<Chunk>, Vec<Vec<f32>>)> {
         let chunks = chunk_store(store)?;
         let mut cache: Cache = std::fs::read(cache_path())
             .ok()
@@ -304,11 +355,7 @@ impl Index {
             .iter()
             .map(|c| cache.embeddings[&c.hash].clone())
             .collect();
-        Ok(Self {
-            chunks,
-            embeddings,
-            model,
-        })
+        Ok((chunks, embeddings))
     }
 
     /// Like [`Self::search`] but also returns the **median** score across the
