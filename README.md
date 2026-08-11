@@ -34,7 +34,14 @@ Semantic search MCP server over the pos108 shared memory store
 One tool: `memory_search(query, k)` — Thai and English both work.
 Dev query loop: `cargo run --release --bin tryquery`.
 
-## Regression bench
+## Checks
+
+    scripts/check-all.sh          # all three, ~80 s
+    scripts/check-all.sh --quick  # skips the soak, ~10 s
+    SOAK_N=10000 scripts/check-all.sh
+
+Runs every check even if one fails, prints a summary, and exits with the number
+that failed. The three below can also be run on their own.
 
     scripts/bench-both.py             # both paths, exit 1 on regression
     scripts/bench-both.py --verbose   # per-query ranks
