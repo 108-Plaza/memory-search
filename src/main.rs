@@ -4,14 +4,29 @@
 //!   { "mcpServers": { "memory-search": {
 //!       "command": "/Users/yongyutjantaboot/108-POS/memory-search/target/release/memory-search" } } }
 //!
-//! The index is built at startup and re-stat'd before every search, so a
-//! memory written mid-session is searchable immediately. It did NOT use to be:
-//! the index was frozen at boot, which made `memory_search` answer "nothing
-//! recorded" about a file that had just been written — measured 2026-08-11 with
-//! a probe file the daemon found and this server could not see at all.
+//! **This process holds no index and no model.** It is a thin client of
+//! `memq serve` over `~/.cache/memory-search/memqd.sock`, which already holds
+//! BGE-M3 resident for the `UserPromptSubmit` hook.
+//!
+//! It used to build its own. That is one **1.78 GB** copy of the model per
+//! Claude session, and sessions accumulate: eight were live on 2026-08-11
+//! holding ~7 GB between them, on top of the daemon's own 1.86 GB. Nothing
+//! noticed because macOS pages the idle ones out to near zero. Sharing the
+//! daemon makes it one copy per machine no matter how many sessions are open.
+//!
+//! What that trades away: the daemon answers serially, so a query can queue
+//! behind another session's — invisible at ~30 ms, seconds while it reindexes
+//! after a large memory is written. Worth it, and the previous design paid the
+//! same reindex cost per session anyway.
+//!
+//! Freshness comes free with it. The daemon re-stats the store per request, so
+//! a memory written mid-session is searchable at once — this server used to
+//! freeze its index at boot and answer "nothing recorded" about a file that had
+//! just been written (measured 2026-08-11, with a probe the daemon found and
+//! this one could not see at all).
 
-use anyhow::Result;
-use memory_search::{store_stamp, Index, LinkGraph, STORE};
+use anyhow::{bail, Context, Result};
+use memory_search::socket_path;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -19,8 +34,8 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchArgs {
@@ -30,62 +45,103 @@ struct SearchArgs {
     k: Option<usize>,
 }
 
-struct State {
-    index: Index,
-    graph: LinkGraph,
-    /// Newest store mtime the above was built from.
-    stamp: std::time::SystemTime,
-}
+/// A cold daemon loads the model before it can answer. Measured at ~2.6 s; this
+/// is slack for a loaded machine, and it is only ever paid once.
+const DAEMON_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-impl State {
-    /// Pick up memories written since the last search. Nothing to do in the
-    /// common case; when a file did change, only its chunks are re-embedded.
-    /// A failed rebuild keeps the previous index rather than failing the query.
-    fn refresh_if_stale(&mut self) {
-        let now = store_stamp();
-        if now <= self.stamp {
-            return;
+/// One query against `memq serve`, in the ungated `raw` mode: every hit with
+/// its score, formatted here rather than by the daemon's hook policy.
+fn query_daemon(query: &str, k: usize) -> Result<String> {
+    let req = serde_json::json!({ "q": query, "k": k, "raw": true });
+
+    let mut stream = match UnixStream::connect(socket_path()) {
+        Ok(s) => s,
+        // Under launchd the daemon is always up, so this is the cold-boot case:
+        // start it and wait, rather than fall back to loading a second model —
+        // the whole point of this process is that it does not own one.
+        Err(_) => {
+            start_daemon()?;
+            UnixStream::connect(socket_path()).context("daemon started but is not accepting")?
         }
-        let t = std::time::Instant::now();
-        let store = std::path::Path::new(STORE);
-        match (self.index.refresh(store), LinkGraph::build(store)) {
-            (Ok(()), Ok(g)) => {
-                self.graph = g;
-                self.stamp = now;
-                tracing::info!(
-                    "store changed — reindexed {} chunks in {:?}",
-                    self.index.chunks.len(),
-                    t.elapsed()
-                );
-            }
-            (r_idx, r_graph) => {
-                // Leave `stamp` behind so the next call retries.
-                for e in [r_idx.err(), r_graph.err().map(|e| e.context("link graph"))]
-                    .into_iter()
-                    .flatten()
-                {
-                    tracing::warn!("reindex failed, serving the previous index: {e:#}");
-                }
-            }
+    };
+
+    writeln!(stream, "{req}")?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw)?;
+    let resp: serde_json::Value =
+        serde_json::from_str(raw.trim()).context("daemon sent something that is not JSON")?;
+
+    let empty = vec![];
+    let hits = resp["hits"].as_array().unwrap_or(&empty);
+    let mut out = hits
+        .iter()
+        .map(|h| {
+            let heading = h["heading"].as_str().unwrap_or_default();
+            format!(
+                "### {} — {} (score {:.3})\n{}",
+                h["file"].as_str().unwrap_or("?"),
+                if heading.is_empty() { "(top)" } else { heading },
+                h["score"].as_f64().unwrap_or_default(),
+                h["body"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // The store's own `[[wikilinks]]`, one hop out. Names only: whoever wrote
+    // the memory decided these belong together, which is context a cosine score
+    // cannot rank into the top k.
+    if let Some(related) = resp["related"].as_array().filter(|r| !r.is_empty()) {
+        out.push_str("\n\n### Linked from the above (names only — read if relevant)\n");
+        for r in related {
+            out.push_str(&format!(
+                "- `{}` — {}\n",
+                r["name"].as_str().unwrap_or("?"),
+                r["desc"].as_str().unwrap_or_default()
+            ));
         }
     }
+    Ok(out)
+}
+
+/// Spawn `memq serve` (the sibling binary) detached and wait for its socket.
+fn start_daemon() -> Result<()> {
+    let memq = std::env::current_exe()?
+        .parent()
+        .context("binary has no parent directory")?
+        .join("memq");
+    if !memq.exists() {
+        bail!("memqd is not running and {memq:?} does not exist to start it");
+    }
+    tracing::info!("memqd not reachable — starting {memq:?}");
+    std::process::Command::new(&memq)
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning {memq:?}"))?;
+
+    let deadline = std::time::Instant::now() + DAEMON_START_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if UnixStream::connect(socket_path()).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("memqd did not come up within {DAEMON_START_TIMEOUT:?} — check ~/Library/Logs/memqd.log")
 }
 
 #[derive(Clone)]
 struct MemorySearch {
-    state: Arc<Mutex<State>>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MemorySearch {
-    fn new(index: Index, graph: LinkGraph, stamp: std::time::SystemTime) -> Self {
+    fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(State {
-                index,
-                graph,
-                stamp,
-            })),
             tool_router: Self::tool_router(),
         }
     }
@@ -102,54 +158,13 @@ impl MemorySearch {
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
         let k = args.k.unwrap_or(5).min(20);
-        let state = self.state.clone();
         let query = args.query.clone();
-        // fastembed is sync; keep the async runtime responsive.
-        let hits = tokio::task::spawn_blocking(move || {
-            let mut guard = state.blocking_lock();
-            let st = &mut *guard;
-            st.refresh_if_stale();
-            let graph = &st.graph;
-            st.index.search(&query, k).map(|hits| {
-                let mut matched: Vec<String> = Vec::new();
-                let mut body = hits
-                    .into_iter()
-                    .map(|(score, c)| {
-                        if !matched.contains(&c.file) {
-                            matched.push(c.file.clone());
-                        }
-                        format!(
-                            "### {} — {} (score {:.3})\n{}",
-                            c.file,
-                            if c.heading.is_empty() {
-                                "(top)"
-                            } else {
-                                &c.heading
-                            },
-                            score,
-                            // Skip the synthetic context header line we prepended.
-                            c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-
-                // The store's own `[[wikilinks]]`, one hop out. Names only:
-                // whoever wrote the memory decided these belong together, which
-                // is context a cosine score cannot rank into the top k.
-                let related = graph.neighbours(&matched, 5);
-                if !related.is_empty() {
-                    body.push_str("\n\n### Linked from the above (names only — read if relevant)\n");
-                    for (name, desc) in related {
-                        body.push_str(&format!("- `{name}` — {desc}\n"));
-                    }
-                }
-                body
-            })
-        })
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // The socket call is blocking, and a cold daemon can hold it for
+        // seconds; keep it off the async runtime.
+        let hits = tokio::task::spawn_blocking(move || query_daemon(&query, k))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(hits)]))
     }
@@ -177,21 +192,15 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    // Build the index BEFORE accepting the transport: the first tool call
-    // must never pay the model-load cost. Stamp first, so a write racing the
-    // build is re-picked-up rather than assumed included.
-    let t = std::time::Instant::now();
-    let stamp = store_stamp();
-    let index = tokio::task::spawn_blocking(|| Index::build(std::path::Path::new(STORE))).await??;
-    let graph = LinkGraph::build(std::path::Path::new(STORE))?;
-    tracing::info!(
-        "index ready: {} chunks, {} linked files in {:?}",
-        index.chunks.len(),
-        graph.descriptions.len(),
-        t.elapsed()
-    );
+    // Start serving immediately — there is nothing to load. If the daemon is
+    // cold, the first search pays for it and every later session gets it warm.
+    // Failing here instead would take the tool out over a daemon that launchd
+    // brings back on its own.
+    if let Err(e) = tokio::task::spawn_blocking(|| UnixStream::connect(socket_path())).await? {
+        tracing::warn!("memqd not reachable at startup ({e}); the first search will start it");
+    }
 
-    let service = MemorySearch::new(index, graph, stamp).serve(stdio()).await?;
+    let service = MemorySearch::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

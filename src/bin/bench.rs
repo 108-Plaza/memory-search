@@ -6,14 +6,18 @@ fn main() -> anyhow::Result<()> {
     let mut idx = Index::build(std::path::Path::new(STORE))?;
     for line in std::io::stdin().lock().lines() {
         let q = line?;
-        if q.trim().is_empty() { continue; }
+        if q.trim().is_empty() {
+            continue;
+        }
         let hits = idx.search(&q, 40)?;
         let mut files: Vec<(String, f32)> = Vec::new();
         for (s, c) in hits {
             if !files.iter().any(|(f, _)| *f == c.file) {
                 files.push((c.file.clone(), s));
             }
-            if files.len() == 5 { break; }
+            if files.len() == 5 {
+                break;
+            }
         }
         let row: Vec<String> = files.iter().map(|(f, s)| format!("{f}:{s:.3}")).collect();
         println!("{q}\t{}", row.join(","));

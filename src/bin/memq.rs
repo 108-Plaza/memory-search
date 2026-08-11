@@ -23,10 +23,9 @@
 //! lookup must never be able to break the user's turn.
 
 use anyhow::{Context, Result};
-use memory_search::{store_stamp, Index, LinkGraph, STORE};
+use memory_search::{socket_path, store_stamp, Index, LinkGraph, STORE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 
 /// Below this cosine score a hit is noise; injecting it costs context and
 /// teaches the model to ignore the block. Calibrated against the store — see
@@ -94,13 +93,6 @@ const POOL: usize = 40;
 /// the ones a human would have thought of.
 const RELATED_LIMIT: usize = 5;
 
-fn socket_path() -> PathBuf {
-    memory_search::cache_path()
-        .parent()
-        .expect("cache path has a parent")
-        .join("memqd.sock")
-}
-
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -157,9 +149,12 @@ fn serve() -> Result<()> {
     let listener = UnixListener::bind(&sock).with_context(|| format!("binding {sock:?}"))?;
     eprintln!("memqd: listening on {sock:?}");
 
-    // Serial by design: a query is ~100 ms and the only client is a hook that
-    // fires once per prompt. Concurrency here would buy nothing and would need
-    // the model behind a lock anyway.
+    // Serial by design: a query is ~30 ms and the model would need a lock
+    // anyway, so concurrency buys almost nothing. Since 2026-08-11 the clients
+    // are the hook AND every session's MCP server, so requests do queue — at
+    // 30 ms that is invisible, but a reindex after a large write blocks the lot
+    // for seconds. That is the price of one resident model instead of one per
+    // session (~1.78 GB each).
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -205,6 +200,15 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
     let req: serde_json::Value = serde_json::from_str(line.trim())?;
     let q = req["q"].as_str().unwrap_or_default();
     let k = req["k"].as_u64().unwrap_or(DEFAULT_K as u64) as usize;
+
+    // `"raw": true` — the MCP server's mode. It shares the resident model but
+    // NOT the hook's editorial policy: an agent that chose to search wants every
+    // hit with its score and formats them itself, where the hook is spending a
+    // context budget nobody asked for and must gate hard. Same index, different
+    // contract, so the gates and the file-dedup below stay on the hook's path.
+    if req["raw"].as_bool().unwrap_or(false) {
+        return handle_raw(stream, index, graph, q, k);
+    }
 
     // Scored over the whole store regardless of the pool — the median, and so
     // the margin gate, is unaffected by how deep we walk.
@@ -255,6 +259,47 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
     }
 
     stream.write_all(out.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Ungated results as one JSON line: `{hits:[{file,heading,score,body}],
+/// related:[{name,desc}]}`. No `MIN_SCORE`, no margin test, no dedup — the
+/// caller decides. `related` still follows the store's own `[[wikilinks]]` one
+/// hop out from the files that matched, which is context no cosine score ranks.
+fn handle_raw(
+    stream: &mut UnixStream,
+    index: &mut Index,
+    graph: &LinkGraph,
+    q: &str,
+    k: usize,
+) -> Result<()> {
+    let (hits, _median) = index.search_scored(q, k)?;
+    let mut matched: Vec<String> = Vec::new();
+    let hits: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(score, c)| {
+            if !matched.contains(&c.file) {
+                matched.push(c.file.clone());
+            }
+            serde_json::json!({
+                "file": c.file,
+                "heading": c.heading,
+                "score": score,
+                // Drop the synthetic context header the chunker prepends.
+                "body": c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text),
+            })
+        })
+        .collect();
+
+    let related: Vec<serde_json::Value> = graph
+        .neighbours(&matched, RELATED_LIMIT)
+        .into_iter()
+        .map(|(name, desc)| serde_json::json!({ "name": name, "desc": desc }))
+        .collect();
+
+    let body = serde_json::json!({ "hits": hits, "related": related });
+    writeln!(stream, "{body}")?;
     stream.flush()?;
     Ok(())
 }

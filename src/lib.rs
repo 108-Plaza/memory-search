@@ -20,6 +20,15 @@ use std::path::{Path, PathBuf};
 
 pub const STORE: &str = "/Users/yongyutjantaboot/.claude/shared-memory/pos108";
 
+/// Where `memq serve` listens. Both clients — the `UserPromptSubmit` hook and
+/// the MCP server — reach the one resident index through this.
+pub fn socket_path() -> PathBuf {
+    cache_path()
+        .parent()
+        .expect("cache path has a parent")
+        .join("memqd.sock")
+}
+
 /// Newest mtime among the store's `*.md` **and the directory itself**. Both the
 /// daemon and the MCP server re-stat before serving and rebuild when this moves.
 ///
@@ -216,11 +225,11 @@ impl LinkGraph {
             };
             let raw = std::fs::read_to_string(&path)?;
 
-            if let Some(d) = raw.lines().find_map(|l| l.trim().strip_prefix("description:")) {
-                descriptions.insert(
-                    stem.clone(),
-                    d.trim().trim_matches('"').to_string(),
-                );
+            if let Some(d) = raw
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("description:"))
+            {
+                descriptions.insert(stem.clone(), d.trim().trim_matches('"').to_string());
             }
 
             // `[[name]]` — a dangling link is normal here (it marks a memory
