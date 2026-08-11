@@ -31,7 +31,20 @@ use std::path::PathBuf;
 /// Below this cosine score a hit is noise; injecting it costs context and
 /// teaches the model to ignore the block. Calibrated against the store — see
 /// `docs/HOOK.md`.
-const MIN_SCORE: f32 = 0.55;
+///
+/// Lowered 0.55 → 0.52 on 2026-08-11 (owner's number). 0.55 sat *inside* the
+/// band of true hits: real answers scored 0.543–0.677, so the cutoff cost
+/// recall. It dropped `pos108-escpos-thai-encoding` — ranked **first** for a
+/// garbled-printing question at 0.543 — and with it the whole block, since
+/// nothing else cleared the bar.
+///
+/// ⚠️ The usable window is **narrow**, so do not treat 0.52 as having room:
+/// against 9 off-topic controls the loudest correctly-rejected one is a casual
+/// acknowledgement at **0.514**, only 0.006 below the gate, and the first true
+/// hit is at 0.543. Anything in 0.515–0.543 works; 0.53 is the midpoint if you
+/// want the two errors weighted evenly. Height alone cannot do better than
+/// that — see `MIN_MARGIN`, and the prose case recorded with it.
+const MIN_SCORE: f32 = 0.52;
 
 /// Prompts shorter than this are greetings, acknowledgements and `/commands`.
 /// Embedding them returns whatever is nearest, which is worse than nothing.
@@ -49,9 +62,30 @@ const MIN_PROMPT_CHARS: usize = 12;
 /// 0.13 splits a genuinely narrow gap — the tightest true positive measured is
 /// 0.144 (a Thai receipt-encoding question) against that paste's 0.121. If real
 /// questions start being dropped, this is the first number to look at.
+///
+/// ⚠️ **Known escape, and neither gate can close it.** A paragraph of ordinary
+/// business prose ("modest increase in customer satisfaction across all
+/// regions… the new onboarding process piloted last spring") scores **0.558**
+/// against `customer-platform-repo` AND peaks, so it is injected. It predates
+/// the 0.55 → 0.52 change — 0.558 cleared the old cutoff too — and height
+/// cannot separate it, since 0.558 sits mid-band among real answers. It is not
+/// really a false *match* either: the store genuinely holds customer-platform
+/// memories and the paragraph is genuinely about that. The cost is one
+/// irrelevant block on a prompt that was pasted, not asked. Closing it needs a
+/// different axis (is this a QUESTION?), not a different threshold.
 const MIN_MARGIN: f32 = 0.13;
 
+/// How many **files** to inject. Chunks are deduped to one per file, so this is
+/// three distinct memories rather than three passages that may all come from
+/// the same one — measured 2026-08-11, a single query spent every slot on three
+/// chunks of `identity-platform-auth-history`, which is the whole hook budget
+/// on one memory.
 const DEFAULT_K: usize = 3;
+
+/// Chunks scored before dedup. Deep enough that `DEFAULT_K` distinct files
+/// survive even when the leaders are all sections of one hub file; the scoring
+/// itself is over the whole store either way, so this only bounds the walk.
+const POOL: usize = 40;
 
 /// Neighbours are one line each, but they are also the cheapest thing to
 /// over-produce — a well-linked hub can reach 20 files. Five is enough to name
@@ -170,7 +204,9 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
     let q = req["q"].as_str().unwrap_or_default();
     let k = req["k"].as_u64().unwrap_or(DEFAULT_K as u64) as usize;
 
-    let (hits, median) = index.search_scored(q, k)?;
+    // Scored over the whole store regardless of the pool — the median, and so
+    // the margin gate, is unaffected by how deep we walk.
+    let (hits, median) = index.search_scored(q, POOL.max(k))?;
     let mut out = String::new();
     let mut matched: Vec<String> = Vec::new();
 
@@ -178,22 +214,27 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
     // Judged on the best hit, so one strong match still carries weaker ones.
     let peaked = hits.first().is_some_and(|(s, _)| *s - median >= MIN_MARGIN);
 
-    for (score, c) in hits {
-        if score < MIN_SCORE || !peaked {
-            continue;
-        }
-        let heading = if c.heading.is_empty() {
-            "(top)"
-        } else {
-            &c.heading
-        };
-        // Drop the synthetic context header the chunker prepends.
-        let body = c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text);
-        out.push_str(&format!(
-            "### {} — {heading} (score {score:.3})\n{body}\n\n",
-            c.file
-        ));
-        if !matched.contains(&c.file) {
+    if peaked {
+        for (score, c) in hits {
+            // Sorted descending, so the first sub-threshold hit ends it.
+            if score < MIN_SCORE || matched.len() == k {
+                break;
+            }
+            // One chunk per file: the best-scoring section speaks for it.
+            if matched.contains(&c.file) {
+                continue;
+            }
+            let heading = if c.heading.is_empty() {
+                "(top)"
+            } else {
+                &c.heading
+            };
+            // Drop the synthetic context header the chunker prepends.
+            let body = c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text);
+            out.push_str(&format!(
+                "### {} — {heading} (score {score:.3})\n{body}\n\n",
+                c.file
+            ));
             matched.push(c.file.clone());
         }
     }
