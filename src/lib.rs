@@ -91,7 +91,7 @@ pub fn model_dir() -> PathBuf {
 }
 
 /// Split one memory file into chunks: frontmatter description is prepended to
-/// the first chunk (it names the topic — retrieval quality depends on it),
+/// every chunk (it names the topic — retrieval quality depends on it),
 /// then split on `## ` headings, then oversized sections on blank lines.
 pub fn chunk_file(name: &str, raw: &str) -> Vec<Chunk> {
     // Strip frontmatter, keep its description line as context.
