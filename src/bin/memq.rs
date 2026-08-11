@@ -32,19 +32,21 @@ use std::path::PathBuf;
 /// teaches the model to ignore the block. Calibrated against the store — see
 /// `docs/HOOK.md`.
 ///
-/// Lowered 0.55 → 0.52 on 2026-08-11 (owner's number). 0.55 sat *inside* the
-/// band of true hits: real answers scored 0.543–0.677, so the cutoff cost
-/// recall. It dropped `pos108-escpos-thai-encoding` — ranked **first** for a
+/// Lowered 0.55 → 0.52 → **0.53** on 2026-08-11. 0.55 sat *inside* the band of
+/// true hits: real answers scored 0.543–0.677, so the cutoff cost recall. It
+/// dropped `pos108-escpos-thai-encoding` — ranked **first** for a
 /// garbled-printing question at 0.543 — and with it the whole block, since
 /// nothing else cleared the bar.
 ///
-/// ⚠️ The usable window is **narrow**, so do not treat 0.52 as having room:
-/// against 9 off-topic controls the loudest correctly-rejected one is a casual
-/// acknowledgement at **0.514**, only 0.006 below the gate, and the first true
-/// hit is at 0.543. Anything in 0.515–0.543 works; 0.53 is the midpoint if you
-/// want the two errors weighted evenly. Height alone cannot do better than
-/// that — see `MIN_MARGIN`, and the prose case recorded with it.
-const MIN_SCORE: f32 = 0.52;
+/// ⚠️ The usable window is **~0.03 wide** and this number sits in the middle of
+/// it, deliberately. Measured against 9 off-topic controls, the loudest
+/// correctly-rejected one is a casual acknowledgement at **0.514**; the lowest
+/// true hit is **0.543**. So 0.515–0.543 all behave identically on this
+/// evidence, and 0.53 is the midpoint — ~0.016 of air on the noise side,
+/// ~0.013 on the recall side. Anything outside that range trades one error for
+/// the other. Re-run the controls before touching it; height alone cannot do
+/// better than this — see `MIN_MARGIN` and the prose case recorded with it.
+const MIN_SCORE: f32 = 0.53;
 
 /// Prompts shorter than this are greetings, acknowledgements and `/commands`.
 /// Embedding them returns whatever is nearest, which is worse than nothing.
@@ -67,7 +69,7 @@ const MIN_PROMPT_CHARS: usize = 12;
 /// business prose ("modest increase in customer satisfaction across all
 /// regions… the new onboarding process piloted last spring") scores **0.558**
 /// against `customer-platform-repo` AND peaks, so it is injected. It predates
-/// the 0.55 → 0.52 change — 0.558 cleared the old cutoff too — and height
+/// today's lowering — 0.558 cleared the old 0.55 cutoff too — and height
 /// cannot separate it, since 0.558 sits mid-band among real answers. It is not
 /// really a false *match* either: the store genuinely holds customer-platform
 /// memories and the paragraph is genuinely about that. The cost is one
