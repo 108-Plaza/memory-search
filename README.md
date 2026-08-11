@@ -56,9 +56,13 @@ Two request modes on the socket, same index:
 | client | `memq hook` | the MCP server |
 | output | markdown, gated | JSON, ungated |
 | `MIN_SCORE` + margin | applied | not applied |
-| one chunk per file | yes | no |
+| `k` counts | files | files |
 
-The split is deliberate: the hook spends a context budget nobody asked for and
-must gate hard, while an agent that *chose* to search wants every hit and its
-score. If the daemon is down when the MCP server needs it, the server starts one
-and waits (~1 s cold) rather than loading a second copy of the model.
+The split is only about gating: the hook spends a context budget nobody asked
+for and must reject hard, while an agent that *chose* to search wants to see
+what there is and judge for itself. Both dedup to one chunk per file — the raw
+path did not at first, and measurement killed the idea: 11 of 12 bench queries
+had one file take more than one of five slots, costing a real answer.
+
+If the daemon is down when the MCP server needs it, the server starts one and
+waits (~1 s cold) rather than loading a second copy of the model.

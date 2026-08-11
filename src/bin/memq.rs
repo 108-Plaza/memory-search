@@ -264,9 +264,19 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
 }
 
 /// Ungated results as one JSON line: `{hits:[{file,heading,score,body}],
-/// related:[{name,desc}]}`. No `MIN_SCORE`, no margin test, no dedup — the
-/// caller decides. `related` still follows the store's own `[[wikilinks]]` one
-/// hop out from the files that matched, which is context no cosine score ranks.
+/// related:[{name,desc}]}`. No `MIN_SCORE` and no margin test — an agent that
+/// chose to search wants to see what there is and judge for itself.
+///
+/// It IS deduped to one chunk per file, same as the hook. That was left off at
+/// first, on the theory that two sections of the right memory are useful rather
+/// than wasteful. Measured 2026-08-11 and the theory lost: **11 of 12 bench
+/// queries had a file take more than one of five slots**, and it cost a real
+/// answer — `tenant-decommission-two-phase` (file-rank 4) fell off the list
+/// because `enrol-must-show-url-shop-package` occupied two. `k` means files on
+/// both paths now, and an agent that wants more sections can raise it.
+///
+/// `related` follows the store's own `[[wikilinks]]` one hop out from the files
+/// that matched, which is context no cosine score ranks.
 fn handle_raw(
     stream: &mut UnixStream,
     index: &mut Index,
@@ -274,23 +284,25 @@ fn handle_raw(
     q: &str,
     k: usize,
 ) -> Result<()> {
-    let (hits, _median) = index.search_scored(q, k)?;
+    let (scored, _median) = index.search_scored(q, POOL.max(k))?;
     let mut matched: Vec<String> = Vec::new();
-    let hits: Vec<serde_json::Value> = hits
-        .into_iter()
-        .map(|(score, c)| {
-            if !matched.contains(&c.file) {
-                matched.push(c.file.clone());
-            }
-            serde_json::json!({
-                "file": c.file,
-                "heading": c.heading,
-                "score": score,
-                // Drop the synthetic context header the chunker prepends.
-                "body": c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text),
-            })
-        })
-        .collect();
+    let mut hits: Vec<serde_json::Value> = Vec::new();
+    for (score, c) in scored {
+        if matched.len() == k {
+            break;
+        }
+        if matched.contains(&c.file) {
+            continue;
+        }
+        matched.push(c.file.clone());
+        hits.push(serde_json::json!({
+            "file": c.file,
+            "heading": c.heading,
+            "score": score,
+            // Drop the synthetic context header the chunker prepends.
+            "body": c.text.splitn(2, '\n').nth(1).unwrap_or(&c.text),
+        }));
+    }
 
     let related: Vec<serde_json::Value> = graph
         .neighbours(&matched, RELATED_LIMIT)
