@@ -149,12 +149,15 @@ fn serve() -> Result<()> {
     let listener = UnixListener::bind(&sock).with_context(|| format!("binding {sock:?}"))?;
     eprintln!("memqd: listening on {sock:?}");
 
-    // Serial by design: a query is ~30 ms and the model would need a lock
-    // anyway, so concurrency buys almost nothing. Since 2026-08-11 the clients
-    // are the hook AND every session's MCP server, so requests do queue — at
-    // 30 ms that is invisible, but a reindex after a large write blocks the lot
-    // for seconds. That is the price of one resident model instead of one per
-    // session (~1.78 GB each).
+    // Serial by design, and the arithmetic says it stays that way. A query is
+    // ~30 ms; the real load is at most ~10 Claude sessions firing ONE query per
+    // prompt, so two requests would have to land inside the same 30 ms window
+    // to queue at all. Concurrency would also need the model behind a lock.
+    //
+    // What DOES block everyone is a reindex after a large memory is written —
+    // seconds, and unrelated to how many clients there are. If that ever needs
+    // fixing, move embedding off the request path; adding threads here would
+    // not touch it.
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,

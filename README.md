@@ -12,9 +12,11 @@ Semantic search MCP server over the pos108 shared memory store
 - **One model per machine, not per session.** `memq serve` is the only process
   that loads BGE-M3; the MCP server is a thin client of its socket and sits at
   **~9 MB**. It used to build its own index — 1.78 GB per open Claude session,
-  ~7 GB across the eight that were live on 2026-08-11. The cost of sharing is
-  that the daemon answers serially, so queries queue: nothing at ~30 ms, seconds
-  while it reindexes after a large write.
+  ~7 GB across the eight that were live on 2026-08-11. Sharing costs less than
+  it looks: the daemon is serial, but a query is ~30 ms against ~10 sessions at
+  one query per prompt, so queuing needs two requests inside the same 30 ms. The
+  reindex after a large write does stall everyone for seconds — that one is not
+  about sharing.
 - The markdown store stays the source of truth; this crate only reads it. The
   daemon re-stats the store before serving (`store_stamp`) and refreshes when a
   memory is written, deleted or renamed, so a memory written mid-session is

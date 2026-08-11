@@ -14,10 +14,11 @@
 //! noticed because macOS pages the idle ones out to near zero. Sharing the
 //! daemon makes it one copy per machine no matter how many sessions are open.
 //!
-//! What that trades away: the daemon answers serially, so a query can queue
-//! behind another session's — invisible at ~30 ms, seconds while it reindexes
-//! after a large memory is written. Worth it, and the previous design paid the
-//! same reindex cost per session anyway.
+//! The daemon answers serially, which sounds like the trade and is not: a query
+//! is ~30 ms and the real load is ~10 sessions at one query per prompt, so two
+//! would have to arrive inside the same 30 ms to queue. The reindex after a
+//! large memory write does block every client for seconds — but that is not
+//! about sharing, and the previous design paid it per session anyway.
 //!
 //! Freshness comes free with it. The daemon re-stats the store per request, so
 //! a memory written mid-session is searchable at once — this server used to
