@@ -51,6 +51,13 @@ either output path. Baseline at 278 files / 1372 chunks: recall 7/12 at k=3 and
 9/12 at k=5 on both paths, ~28 ms median, one known false positive on the hook
 (a paragraph of business prose that genuinely resembles the store).
 
+`scripts/freshness-test.py` covers what the bench cannot: is a memory searchable
+the moment it is **written, edited and deleted**? Three cases, because
+`store_stamp` has two halves — an edit moves only the file's mtime, a delete
+moves only the directory's. The delete case shipped broken on 2026-08-11 and is
+the reason this exists; the bench passed the whole time. It writes one probe
+into the real store and removes it in a `finally`.
+
 `scripts/soak.py N` answers a different question — does memqd's RSS keep
 growing? Measured over 10,000 queries: 1815 MB fresh, +144 MB in the first
 quarter of the run, **+1 MB in the last**, flat at ~1983 MB. An ONNX arena
