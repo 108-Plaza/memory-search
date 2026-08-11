@@ -32,6 +32,23 @@ Semantic search MCP server over the pos108 shared memory store
 One tool: `memory_search(query, k)` — Thai and English both work.
 Dev query loop: `cargo run --release --bin tryquery`.
 
+## Regression bench
+
+    scripts/bench-both.py             # both paths, exit 1 on regression
+    scripts/bench-both.py --verbose   # per-query ranks
+    scripts/bench-both.py --hook      # hook path only, no binary needed
+
+21 queries — 12 paraphrases that share no words with their target filename, plus
+9 off-topic controls — against **both** paths, with recall floors that fail the
+run if a change gives ground. It also fails if the two paths stop missing the
+same things, since they read one index and a divergence means an output path is
+dropping results; and if a renamed memory turns a case into a silent zero.
+
+Run it after touching `MIN_SCORE`, `MIN_MARGIN`, the chunker, the model, or
+either output path. Baseline at 278 files / 1372 chunks: recall 7/12 at k=3 and
+9/12 at k=5 on both paths, ~28 ms median, one known false positive on the hook
+(a paragraph of business prose that genuinely resembles the store).
+
 ## memqd — automatic retrieval (the `UserPromptSubmit` hook)
 
 `memq hook` injects the top hits into every prompt; `memq serve` is the resident
