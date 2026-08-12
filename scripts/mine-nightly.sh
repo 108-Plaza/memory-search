@@ -52,9 +52,37 @@ push_store() {
     echo "สโตร์: push ล้ม (เน็ต/สิทธิ์?) — รอบขุดยังทำงานต่อ" >&2
   fi
 }
-# เรียกตรงนี้ ก่อนด่าน early-exit ทั้งหมด เพื่อให้สำรองทำงานทุกคืน
+# ── บอกทุกคืนว่ามี memory ค้างไม่ commit อยู่เท่าไร ──
+#
+# ทำไมต้องมี: push_store ดันเฉพาะของที่ commit แล้ว (กติกา 08-07) ⇒ ไฟล์ที่เซสชัน
+# เขียนทิ้งไว้ **ไม่มีสำรองเลย** และมันเงียบมาก — 2026-08-12 เจอค้าง 39 ไฟล์
+# ข้ามมา 4 วันโดยไม่มีใครรู้ตัว ตัวเลขบรรทัดเดียวทุกคืนทำให้ไม่ปล่อยยาวแบบนั้นอีก
+# ตัวนี้ **อ่านอย่างเดียว** ไม่ commit ไม่แตะอะไรในสโตร์ — แค่บอกให้คนตัดสินใจ
+report_uncommitted() {
+  git -C "$STORE" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local n new mod oldest now days
+  n=$(git -C "$STORE" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$n" -eq 0 ]; then
+    echo "สโตร์: ไม่มีไฟล์ค้าง — commit ครบแล้ว"
+    return 0
+  fi
+  new=$(git -C "$STORE" status --porcelain | grep -c '^??' || true)
+  mod=$(( n - new ))
+  # เก่าสุด = mtime ที่น้อยที่สุดในกองที่ค้าง บอกว่า "ปล่อยไว้นานแค่ไหน"
+  oldest=$(git -C "$STORE" status --porcelain | sed 's/^...//' | while IFS= read -r f; do
+    [ -f "$STORE/$f" ] && stat -f %m "$STORE/$f"
+  done | sort -n | head -1)
+  now=$(date +%s)
+  days=$(( (now - ${oldest:-$now}) / 86400 ))
+  echo "⚠️ สโตร์: ค้างไม่ commit $n ไฟล์ (ใหม่ $new · แก้ $mod) เก่าสุด $days วัน — ยังไม่มีสำรอง"
+}
+
+# เรียกตรงนี้ ก่อนด่าน early-exit ทั้งหมด เพื่อให้สำรอง+รายงานทำงานทุกคืน
 # แม้คืนนั้นจะไม่มี transcript ใหม่ให้ขุดเลย (ซึ่งเป็นกรณีที่พบบ่อยที่สุด)
-[ "${1:-}" = "--dry" ] || push_store
+if [ "${1:-}" != "--dry" ]; then
+  push_store
+  report_uncommitted
+fi
 
 # launch dirs ของ pos108 = ทุก dir ที่ขึ้นต้นด้วย -...-108-POS  +  home dir เปล่า ๆ
 #
