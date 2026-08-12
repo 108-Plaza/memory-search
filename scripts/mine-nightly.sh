@@ -71,14 +71,26 @@ if [ "${1:-}" = "--dry" ]; then exit 0; fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 i=0
+CONVS=""
 for f in $FILES; do
   i=$((i+1))
   python3 "$DIR/scripts/extract-conversation.py" "$f" > "$WORK/conv-$i.txt"
+  CONVS="$CONVS
+- $WORK/conv-$i.txt"
   echo "== transcript $i: $f ($(wc -l < "$WORK/conv-$i.txt" | tr -d ' ') turns)"
 done
 
 STAMP=$(date +%Y%m%d-%H%M)
-PROMPT="คุณคือ memory miner ของ pos108. อ่านบทสนทนาใน $WORK/conv-*.txt (ใช้ Read ทีละไฟล์)
+
+# ⚠️ ต้องเป็น **ชื่อไฟล์จริงทีละบรรทัด** ห้ามกลับไปใช้ glob (`$WORK/conv-*.txt`)
+# `Read` ขยาย glob ไม่ได้ และ --allowedTools ข้างล่างไม่มี Glob/LS/Bash ⇒ sub-agent
+# ไล่ดูโฟลเดอร์เองไม่ได้เลย พอ Read ล้มมันจะ **เดาสาเหตุผิด** ว่าโดนบล็อกเพราะอยู่นอก
+# cwd แล้วขอให้ย้ายไฟล์ แทนที่จะ error — บวกกับ `touch "$MARK"` ที่ไม่ดู exit code
+# ข้างล่าง = watermark เดินทั้งที่ไม่ได้ขุด, transcript หายถาวร, เงียบสนิท (2026-08-12)
+# ที่ผ่านมามันรอดเพราะบางคืนมันเดาชื่อ conv-1.txt ถูกเอง — สุ่มติดสุ่มหลุด ไม่ใช่เพิ่งพัง
+PROMPT="คุณคือ memory miner ของ pos108. อ่านบทสนทนาต่อไปนี้ให้ครบทุกไฟล์ (ใช้ Read ทีละไฟล์ ด้วย path เต็มตามนี้):
+$CONVS
+
 สกัด fact ที่ควรจำถาวร: การตัดสินใจของเจ้าของ, root cause, gotcha, สิ่งที่ deploy/merge, กฎถาวร
 ทุก fact ต้องเรียก tool memory_search ก่อน — score สูงเนื้อทับ = ทิ้ง, ทับบางส่วน = เสนอเป็น UPDATE ไฟล์เดิม, ไม่เจอ = NEW
 ห้ามเก็บ secret/credential เป็น fact (เจอของหลุดให้ flag ⚠️ แยก)
@@ -95,10 +107,29 @@ PROMPT="คุณคือ memory miner ของ pos108. อ่านบทส�
 # วัดก่อนเปลี่ยน: เทียบ STATS (dedup / NEW / UPDATES) กับรอบก่อนหน้า
 MODEL="${MINER_MODEL:-sonnet}"
 
+# ⚠️ ห้ามเช็ค `$?` เฉย ๆ หลัง pipe — `| tail -3` กลืน exit code ของ claude (ได้ของ tail แทน)
+# และเพราะมี `set -e` + `pipefail` ถ้าปล่อยไว้ claude ล้มจะเด้งออกกลางคันก่อนถึงด่านตรวจ
+# จึงปิด -e เฉพาะช่วงนี้แล้วอ่าน PIPESTATUS[0] (bash 3.2 รองรับ)
+set +e
 claude -p "$PROMPT" \
   --model "$MODEL" \
   --allowedTools "Read,Write,mcp__memory-search__memory_search" \
   --max-turns 40 2>&1 | tail -3
+RC=${PIPESTATUS[0]}
+set -e
+
+# ⚠️ exit 0 ยัง **ไม่พอ** เป็นหลักฐานว่าขุดสำเร็จ — 2026-08-12 claude ออก 0 ทั้งที่ปฏิเสธงาน
+# แล้วตอบเป็น prose โดยไม่เขียนไฟล์ผลเลย ground truth คือ "มีไฟล์ผลจริงและไม่ว่าง" ต่างหาก
+# watermark ขยับต่อเมื่อผ่านทั้งสองด่าน — ล้มด่านไหนก็ไม่ขยับ รอบหน้าจะขุด transcript ชุดเดิมซ้ำ
+# (ดีกว่าปล่อยผ่านเงียบ ๆ แล้ว transcript หายถาวร ซึ่งเป็นสิ่งที่ pipeline นี้มีไว้กันตั้งแต่แรก)
+if [ "$RC" -ne 0 ]; then
+  echo "miner ล้ม (exit $RC) — ไม่ขยับ watermark, รอบหน้าจะขุดชุดเดิมซ้ำ" >&2
+  exit "$RC"
+fi
+if [ ! -s "$OUT/$STAMP.md" ]; then
+  echo "miner ออก 0 แต่ไม่ได้เขียน $OUT/$STAMP.md — ไม่ขยับ watermark, รอบหน้าจะขุดชุดเดิมซ้ำ" >&2
+  exit 1
+fi
 
 touch "$MARK"
 echo "เสร็จ → $OUT/$STAMP.md  (รีวิวแล้วค่อยย้ายเข้ากองกลางเอง)"
