@@ -17,6 +17,44 @@ PROJ="$HOME/.claude/projects"
 MARK="$DIR/.mine-watermark"
 OUT="$DIR/proposals"
 mkdir -p "$OUT"
+STORE="$HOME/.claude/shared-memory/pos108"
+
+# ── สำรองสโตร์ขึ้น GitHub (108-Plaza/pos108-memory, private) ──
+#
+# ⚠️ **push อย่างเดียว ห้าม `add`/`commit` เด็ดขาด** — กติกาเจ้าของ 2026-08-07:
+# ไม่มีอะไรเขียนเข้าสโตร์เองได้ ข้อเสนออยู่ใน proposals/ เจ้าของรับเข้าเอง
+# ตัวนี้จึงดันเฉพาะ commit ที่เจ้าของ commit ไว้แล้ว ไฟล์ที่ยังไม่ commit
+# (เซสชันอื่นเขียนค้าง — ปกติมีเป็นสิบ) ไม่ถูกแตะและไม่ขึ้นไปไหน
+#
+# fast-forward เท่านั้น: ถ้า local ตาม origin อยู่ = มีคนดันจากเครื่องอื่น ให้ข้าม
+# ไปเงียบ ๆ ให้คนมาดูเอง อย่าไปรวมสาขาเองตอนตีสาม
+# push ล้มไม่ทำให้รอบขุดล้ม — มันเป็นงานสำรอง ไม่ใช่งานหลักของสคริปต์นี้
+push_store() {
+  git -C "$STORE" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  git -C "$STORE" remote get-url origin >/dev/null 2>&1 || {
+    echo "สโตร์: ไม่มี remote — ข้าม push"; return 0; }
+  git -C "$STORE" fetch -q origin main 2>/dev/null || {
+    echo "สโตร์: fetch ไม่ได้ — ข้าม push"; return 0; }
+  local ahead behind
+  ahead=$(git -C "$STORE" rev-list --count origin/main..main 2>/dev/null || echo 0)
+  behind=$(git -C "$STORE" rev-list --count main..origin/main 2>/dev/null || echo 0)
+  if [ "$behind" -ne 0 ]; then
+    echo "สโตร์: ตาม origin อยู่ $behind commit (มีคนดันจากที่อื่น) — ไม่ push ให้คนมาดูเอง" >&2
+    return 0
+  fi
+  if [ "$ahead" -eq 0 ]; then
+    echo "สโตร์: ไม่มี commit ใหม่ให้ push"
+    return 0
+  fi
+  if git -C "$STORE" push -q origin main 2>/dev/null; then
+    echo "สโตร์: push $ahead commit ขึ้น origin แล้ว"
+  else
+    echo "สโตร์: push ล้ม (เน็ต/สิทธิ์?) — รอบขุดยังทำงานต่อ" >&2
+  fi
+}
+# เรียกตรงนี้ ก่อนด่าน early-exit ทั้งหมด เพื่อให้สำรองทำงานทุกคืน
+# แม้คืนนั้นจะไม่มี transcript ใหม่ให้ขุดเลย (ซึ่งเป็นกรณีที่พบบ่อยที่สุด)
+[ "${1:-}" = "--dry" ] || push_store
 
 # launch dirs ของ pos108 = ทุก dir ที่ขึ้นต้นด้วย -...-108-POS  +  home dir เปล่า ๆ
 #
