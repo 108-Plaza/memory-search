@@ -23,9 +23,26 @@
 //! lookup must never be able to break the user's turn.
 
 use anyhow::{Context, Result};
-use memory_search::{socket_path, store_stamp, Index, LinkGraph, STORE};
+use memory_search::{socket_path, store_stamp, Index, LinkGraph, Reindex, STORE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// How long the idle daemon waits for a client before re-stat-ing the store.
+/// Short enough that a memory written between two prompts is usually already
+/// embedded by the time it is searched for, long enough to be one wake-up a
+/// second on a machine doing nothing.
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
+/// Deadlines on a served connection. A request is one line sent immediately
+/// after connect and one response written back; both are sub-millisecond on a
+/// socket with a live peer.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for `memq hook` / `memq <text>` waiting on the daemon.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Below this cosine score a hit is noise; injecting it costs context and
 /// teaches the model to ignore the block. Calibrated against the store — see
@@ -130,77 +147,195 @@ fn main() -> Result<()> {
 
 fn serve() -> Result<()> {
     let sock = socket_path();
-    // A socket file left by a killed daemon would make every client hang on
-    // connect, so the bind owns the path unconditionally.
-    let _ = std::fs::remove_file(&sock);
     std::fs::create_dir_all(sock.parent().unwrap())?;
 
-    let t = std::time::Instant::now();
-    let mut stamp = store_stamp();
-    let mut index = Index::build(std::path::Path::new(STORE)).context("building index")?;
-    let mut graph = LinkGraph::build(std::path::Path::new(STORE)).context("building link graph")?;
-    eprintln!(
-        "memqd: {} chunks, {} linked files ready in {:?}",
-        index.chunks.len(),
-        graph.descriptions.len(),
-        t.elapsed()
-    );
+    // Ask before taking the path. `remove_file` below exists for the socket a
+    // killed daemon leaves behind and cannot tell that case from a healthy one,
+    // so an unconditional bind lets any stray `memq serve` UNLINK the running
+    // daemon's socket: the good daemon keeps its index and its now-nameless
+    // listener, and every client after that gets ECONNREFUSED. Measured live
+    // 2026-08-14 — three daemons deep, socket mtime moving every few seconds,
+    // 2.3 GB of resident model each.
+    if UnixStream::connect(&sock).is_ok() {
+        eprintln!("memqd: another daemon already answers on {sock:?} — exiting");
+        return Ok(());
+    }
+    // Nothing answered: the file, if any, is a corpse.
+    let _ = std::fs::remove_file(&sock);
 
+    // Bind BEFORE building the index. A client that finds no socket starts a
+    // daemon of its own (see `start_daemon` in the MCP server), and the index
+    // build is a long window with no socket in it — so a restart under load
+    // grew a SECOND resident BGE-M3, observed live on 2026-08-14: launchd's
+    // daemon came up at 10:22:01, a rival at 10:23:04, 2.3 GB each and both
+    // fighting for the same cores. Binding first closes the window: the client
+    // connects and waits for the answer instead of forking the problem.
     let listener = UnixListener::bind(&sock).with_context(|| format!("binding {sock:?}"))?;
     eprintln!("memqd: listening on {sock:?}");
 
-    // Serial by design, and the arithmetic says it stays that way. A query is
-    // ~30 ms; the real load is at most ~10 Claude sessions firing ONE query per
-    // prompt, so two requests would have to land inside the same 30 ms window
-    // to queue at all. Concurrency would also need the model behind a lock.
-    //
-    // What DOES block everyone is a reindex after a large memory is written —
-    // seconds, and unrelated to how many clients there are. If that ever needs
-    // fixing, move embedding off the request path; adding threads here would
-    // not touch it.
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("memqd: accept failed: {e}");
+    // Accept on its own thread. The main thread stays the ONLY owner of the
+    // model — the index is not shared, it is scheduled — but a client no longer
+    // waits on the kernel backlog while embedding runs, and the loop below can
+    // ask "is anyone waiting?" without blocking. It also means connections that
+    // arrive during the build below are queued, not refused.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    if tx.send(s).is_err() {
+                        return; // main loop is gone
+                    }
+                }
+                Err(e) => eprintln!("memqd: accept failed: {e}"),
+            }
+        }
+    });
+
+    let t = std::time::Instant::now();
+    let (mut index, missing) =
+        Index::build_cached(std::path::Path::new(STORE)).context("building index")?;
+    let mut graph = LinkGraph::build(std::path::Path::new(STORE)).context("building link graph")?;
+    eprintln!(
+        "memqd: {} chunks, {} linked files ready in {:?}{}",
+        index.chunks.len(),
+        graph.descriptions.len(),
+        t.elapsed(),
+        if missing > 0 {
+            format!(" ({missing} not yet embedded — filling in the background)")
+        } else {
+            String::new()
+        }
+    );
+
+    // Deliberately behind every possible store mtime, so the loop below starts
+    // a background pass at once and picks up whatever the cache was missing.
+    let mut stamp = std::time::SystemTime::UNIX_EPOCH;
+
+    // Reindexing used to run inside the accept loop, so every client waited for
+    // it. That is fine at the 1-5 s it normally costs and ruinous at what it
+    // can cost on a loaded machine — 1685 s, measured 2026-08-14 (see
+    // `embed_threads` for the CPU side of that number). The work is the same;
+    // what changed is that it now happens in the GAPS between requests, a batch
+    // at a time, and a waiting client always preempts it.
+    let mut pending: Option<Pending> = None;
+    loop {
+        // A waiting client wins, always.
+        match rx.try_recv() {
+            Ok(mut stream) => {
+                if let Err(e) = handle(&mut stream, &mut index, &graph) {
+                    eprintln!("memqd: request failed: {e:#}");
+                }
                 continue;
             }
-        };
-        // Pick up memories written since boot. `refresh` re-embeds only what
-        // changed INTO the loaded model — a second `Index::build` here would
-        // reload BGE-M3 every time (~1 s and ~200 MB of churn) for nothing.
-        // A failed rebuild keeps serving the old index: stale beats silent.
-        let now = store_stamp();
-        if now > stamp {
-            let t = std::time::Instant::now();
-            match (
-                index.refresh(std::path::Path::new(STORE)),
-                LinkGraph::build(std::path::Path::new(STORE)),
-            ) {
-                (Ok(()), Ok(g)) => {
-                    graph = g;
-                    stamp = now;
-                    eprintln!(
-                        "memqd: store changed — reindexed {} chunks in {:?}",
-                        index.chunks.len(),
-                        t.elapsed()
-                    );
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+
+        // Nobody waiting: start a reindex if the store moved. Stat-ing 300-odd
+        // files is ~1 ms and only happens when there is no reindex in flight.
+        if pending.is_none() {
+            let now = store_stamp();
+            if now > stamp {
+                match Index::begin_reindex(std::path::Path::new(STORE)) {
+                    Ok(work) => {
+                        eprintln!(
+                            "memqd: store changed — embedding {} chunks in the background",
+                            work.work()
+                        );
+                        pending = Some(Pending {
+                            stamp: now,
+                            started: std::time::Instant::now(),
+                            work,
+                        });
+                    }
+                    // Serving the previous index is right: stale beats silent.
+                    // `stamp` is left alone so the next pass retries.
+                    Err(e) => eprintln!(
+                        "memqd: reindex could not start ({e}); serving the previous index"
+                    ),
                 }
-                _ => eprintln!("memqd: reindex failed, serving the previous index"),
             }
         }
 
-        if let Err(e) = handle(&mut stream, &mut index, &graph) {
-            eprintln!("memqd: request failed: {e}");
+        // Nobody waiting and there IS work: one batch, then round again.
+        if let Some(p) = pending.as_mut() {
+            match index.step_reindex(&mut p.work) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let p = pending.take().expect("just matched Some");
+                    let elapsed = p.started.elapsed();
+                    let stamp_at_start = p.stamp;
+                    match (
+                        index.apply(p.work),
+                        LinkGraph::build(std::path::Path::new(STORE)),
+                    ) {
+                        (Ok(()), Ok(g)) => {
+                            graph = g;
+                            stamp = stamp_at_start;
+                            eprintln!(
+                                "memqd: reindexed {} chunks in {:?}",
+                                index.chunks.len(),
+                                elapsed
+                            );
+                        }
+                        _ => eprintln!("memqd: reindex failed, serving the previous index"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("memqd: reindex failed, serving the previous index: {e}");
+                    pending = None;
+                }
+            }
+            continue;
+        }
+
+        // Idle. Block for the next client, but wake often enough that a memory
+        // written while the machine is quiet is embedded BEFORE anyone searches
+        // for it — which is the point of moving this off the request path.
+        match rx.recv_timeout(IDLE_POLL) {
+            Ok(mut stream) => {
+                if let Err(e) = handle(&mut stream, &mut index, &graph) {
+                    eprintln!("memqd: request failed: {e:#}");
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
 }
 
+/// A background reindex in flight, with what it takes to log and commit it.
+struct Pending {
+    /// The store stamp the work was started from — committed only on success,
+    /// so a write that lands mid-reindex is picked up on the next pass.
+    stamp: std::time::SystemTime,
+    started: std::time::Instant,
+    work: Reindex,
+}
+
 fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Result<()> {
+    // One serial loop serves every client, so a peer that connects and then
+    // sends nothing would hold ALL of them — forever, on a blocking read with
+    // no deadline. Requests are one short line written immediately after
+    // connect; anything slower than this is not a client.
+    // macOS fails setsockopt with EINVAL once the peer is gone, which makes this
+    // a free liveness check: a client that already timed out, or a `memq hook`
+    // that exited, is a corpse and not a request. Skip it silently rather than
+    // logging a failure and spending a search on nobody.
+    if stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).is_err()
+        || stream
+            .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+            .is_err()
+    {
+        return Ok(());
+    }
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let req: serde_json::Value = serde_json::from_str(line.trim())?;
+    BufReader::new(stream.try_clone().context("try_clone")?)
+        .read_line(&mut line)
+        .context("read_line")?;
+    let req: serde_json::Value = serde_json::from_str(line.trim()).context("parse request")?;
     let q = req["q"].as_str().unwrap_or_default();
     let k = req["k"].as_u64().unwrap_or(DEFAULT_K as u64) as usize;
 
@@ -261,8 +396,10 @@ fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Resu
         }
     }
 
-    stream.write_all(out.as_bytes())?;
-    stream.flush()?;
+    stream
+        .write_all(out.as_bytes())
+        .context("write hook body")?;
+    stream.flush().context("flush hook")?;
     Ok(())
 }
 
@@ -287,7 +424,9 @@ fn handle_raw(
     q: &str,
     k: usize,
 ) -> Result<()> {
-    let (scored, _median) = index.search_scored(q, POOL.max(k))?;
+    let (scored, _median) = index
+        .search_scored(q, POOL.max(k))
+        .context("search_scored")?;
     let mut matched: Vec<String> = Vec::new();
     let mut hits: Vec<serde_json::Value> = Vec::new();
     for (score, c) in scored {
@@ -314,8 +453,8 @@ fn handle_raw(
         .collect();
 
     let body = serde_json::json!({ "hits": hits, "related": related });
-    writeln!(stream, "{body}")?;
-    stream.flush()?;
+    writeln!(stream, "{body}").context("write raw body")?;
+    stream.flush().context("flush raw")?;
     Ok(())
 }
 
@@ -323,6 +462,12 @@ fn handle_raw(
 
 fn query(q: &str, k: usize) -> Result<String> {
     let mut stream = UnixStream::connect(socket_path())?;
+    // `memq hook` runs on the user's prompt with a 5 s harness timeout, so an
+    // unbounded read here spends that budget doing nothing. Fail fast and let
+    // the hook emit no context — which is its documented behaviour when the
+    // daemon is not answering.
+    stream.set_read_timeout(Some(QUERY_TIMEOUT))?;
+    stream.set_write_timeout(Some(QUERY_TIMEOUT))?;
     let req = serde_json::json!({ "q": q, "k": k });
     writeln!(stream, "{req}")?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -374,9 +519,17 @@ fn hook() -> Result<()> {
     let hits = match query(trimmed, DEFAULT_K) {
         Ok(h) => h,
         Err(_) => {
-            // No daemon (first prompt after a reboot, or it died). Start one and
-            // stay quiet — never fail a turn over a memory lookup.
-            spawn_daemon();
+            // Two very different failures arrive here and only one wants a new
+            // daemon. "Nothing is listening" is the first prompt after a reboot
+            // — start one and stay quiet, never fail a turn over a memory
+            // lookup. "Listening, but did not answer inside QUERY_TIMEOUT" is a
+            // daemon that is merely busy, and spawning a rival for THAT makes it
+            // worse: the rival takes the socket path and orphans a perfectly
+            // good index. Adding the timeout without this check is what turned
+            // one slow daemon into three on 2026-08-14.
+            if UnixStream::connect(socket_path()).is_err() {
+                spawn_daemon();
+            }
             return Ok(());
         }
     };

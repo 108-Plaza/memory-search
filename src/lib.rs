@@ -12,7 +12,7 @@
 //! - Chunks are keyed by content hash, so an unchanged chunk is never
 //!   re-embedded — a boot with no store changes does zero model work.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -299,72 +299,230 @@ pub struct Index {
     model: TextEmbedding,
 }
 
+/// ONNX intra-op threads for the embedding model.
+///
+/// fastembed's default is every core (`available_parallelism`), and ONNX's
+/// thread pool **spin-waits** between ops. On an idle machine that is the
+/// fastest setting. On a busy one it collapses: measured 2026-08-14 with ~12
+/// `rustc`, 3 `flutter_tester` and ~10 Claude sessions live — load average 157
+/// on 16 cores — a reindex that normally takes 1-5 s took **1685 s**, and
+/// `sample` showed the daemon parked in `SpinPause` inside `MlasSgemm`. Sixteen
+/// spinning threads each getting a tenth of a core cannot make progress, and
+/// every client blocked behind it.
+///
+/// Four is deliberately below the core count. This daemon is never the job the
+/// machine is for, and since the reindex moved off the request path (see
+/// `memq serve`) its throughput is no longer what a search waits on.
+fn embed_threads() -> usize {
+    std::env::var("MEMQ_EMBED_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+}
+
+/// Chunks embedded per [`Index::step_reindex`] call.
+///
+/// This is a **latency** knob, not a throughput one: it is the granularity at
+/// which the daemon can stop embedding and answer a waiting search. The old
+/// all-at-once path used 64 to bound peak memory, which is not the binding
+/// constraint here.
+///
+/// Measured 2026-08-14 on the loaded machine this was written for (load average
+/// 86-300 on 16 cores): **~11 s per chunk**. A batch of 16 blocked a waiting
+/// search for ~18 s; a batch of 4 for 31-62 s, timed across 12 live queries
+/// during a 40-chunk reindex. One chunk is therefore the only setting that
+/// bounds the wait by anything the machine controls, and the throughput it
+/// gives up — batching helps the matrix ops a little — is throughput nobody is
+/// waiting on.
+const REINDEX_BATCH: usize = 1;
+
+/// A store re-read in progress: the chunks are known and the cache is loaded,
+/// and what remains is embedding the chunks the cache does not have — in steps,
+/// so the daemon can serve searches between them.
+///
+/// Splitting it this way is the whole point. Embedding used to run to
+/// completion inside the accept loop, so a single changed memory could hold
+/// every client for as long as the machine took to finish it.
+pub struct Reindex {
+    chunks: Vec<Chunk>,
+    cache: Cache,
+    /// Indices into `chunks` that the cache has no embedding for.
+    missing: Vec<usize>,
+    next: usize,
+}
+
+impl Reindex {
+    pub fn remaining(&self) -> usize {
+        self.missing.len().saturating_sub(self.next)
+    }
+    pub fn is_done(&self) -> bool {
+        self.remaining() == 0
+    }
+    /// Chunks the store will have once this is applied.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+    /// Chunks that need embedding — zero when the change was a deletion or a
+    /// rename, which still has to be applied.
+    pub fn work(&self) -> usize {
+        self.missing.len()
+    }
+}
+
 impl Index {
     /// Build the index from scratch, loading the model. Embeds only chunks
     /// missing from cache. Use [`Self::refresh`] to pick up later writes — a
     /// second `build` reloads BGE-M3 (~1 s, ~200 MB of churn) for nothing.
     pub fn build(store: &Path) -> Result<Self> {
-        let mut model = TextEmbedding::try_new(
+        let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::BGEM3)
                 .with_cache_dir(model_dir())
-                .with_show_download_progress(false),
+                .with_show_download_progress(false)
+                .with_intra_threads(embed_threads()),
         )?;
-        let (chunks, embeddings) = Self::load(&mut model, store)?;
-        Ok(Self {
-            chunks,
-            embeddings,
+        let mut index = Self {
+            chunks: Vec::new(),
+            embeddings: Vec::new(),
             model,
-        })
+        };
+        index.refresh(store)?;
+        Ok(index)
     }
 
-    /// Re-read the store into the ALREADY-LOADED model. Cheap when nothing
-    /// changed (every chunk hits the cache) and the only cost when a memory was
-    /// written is embedding that file's chunks.
+    /// Build from the embedding cache ALONE, skipping any chunk it does not
+    /// have. Loads the model but does no model work, so it returns in about the
+    /// time it takes to read 20 MB of JSON.
     ///
-    /// On failure the index is left untouched — a caller that keeps serving the
-    /// previous one is right: stale beats silent.
-    pub fn refresh(&mut self, store: &Path) -> Result<()> {
-        let (chunks, embeddings) = Self::load(&mut self.model, store)?;
-        self.chunks = chunks;
-        self.embeddings = embeddings;
-        Ok(())
-    }
-
-    fn load(model: &mut TextEmbedding, store: &Path) -> Result<(Vec<Chunk>, Vec<Vec<f32>>)> {
-        let chunks = chunk_store(store)?;
-        let mut cache: Cache = std::fs::read(cache_path())
+    /// This is what a daemon should boot with. `build` embeds whatever the
+    /// cache is missing before it returns, and on 2026-08-14 that was **390 s**
+    /// with the socket already bound and clients queueing behind it — the same
+    /// "finish the work, then serve" mistake as the old reindex, just at
+    /// startup. Everything already embedded is searchable immediately and the
+    /// remainder arrives in the background, which is the trade the store's own
+    /// rule prefers: stale beats silent.
+    pub fn build_cached(store: &Path) -> Result<(Self, usize)> {
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::BGEM3)
+                .with_cache_dir(model_dir())
+                .with_show_download_progress(false)
+                .with_intra_threads(embed_threads()),
+        )?;
+        let all = chunk_store(store)?;
+        let cache: Cache = std::fs::read(cache_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-
-        let missing: Vec<&Chunk> = chunks
-            .iter()
-            .filter(|c| !cache.embeddings.contains_key(&c.hash))
-            .collect();
-        if !missing.is_empty() {
-            tracing::info!("embedding {} new/changed chunks", missing.len());
-            // Batch to bound peak memory; 64 texts/batch is comfortable.
-            for batch in missing.chunks(64) {
-                let texts: Vec<&str> = batch.iter().map(|c| c.text.as_str()).collect();
-                let embs = model.embed(texts, None)?;
-                for (c, e) in batch.iter().zip(embs) {
-                    cache.embeddings.insert(c.hash.clone(), e);
-                }
+        let total = all.len();
+        let mut chunks = Vec::with_capacity(total);
+        let mut embeddings = Vec::with_capacity(total);
+        for c in all {
+            if let Some(e) = cache.embeddings.get(&c.hash) {
+                embeddings.push(e.clone());
+                chunks.push(c);
             }
+        }
+        let missing = total - chunks.len();
+        Ok((
+            Self {
+                chunks,
+                embeddings,
+                model,
+            },
+            missing,
+        ))
+    }
+
+    /// Re-read the store into the ALREADY-LOADED model, to completion. Cheap
+    /// when nothing changed (every chunk hits the cache) and the only cost when
+    /// a memory was written is embedding that file's chunks.
+    ///
+    /// On failure the index is left untouched — a caller that keeps serving the
+    /// previous one is right: stale beats silent.
+    ///
+    /// Callers that must stay responsive should drive
+    /// [`Self::begin_reindex`] / [`Self::step_reindex`] / [`Self::apply`]
+    /// instead; this is the same work with no yield points.
+    pub fn refresh(&mut self, store: &Path) -> Result<()> {
+        let mut work = Self::begin_reindex(store)?;
+        while !self.step_reindex(&mut work)? {}
+        self.apply(work)
+    }
+
+    /// Read the store and work out what is missing from the embedding cache.
+    /// Does no model work, so it is safe to call on the request path.
+    pub fn begin_reindex(store: &Path) -> Result<Reindex> {
+        let chunks = chunk_store(store)?;
+        let cache: Cache = std::fs::read(cache_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let missing = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !cache.embeddings.contains_key(&c.hash))
+            .map(|(i, _)| i)
+            .collect();
+        Ok(Reindex {
+            chunks,
+            cache,
+            missing,
+            next: 0,
+        })
+    }
+
+    /// Embed the next [`REINDEX_BATCH`] chunks. `Ok(true)` when nothing is left
+    /// and the result is ready for [`Self::apply`].
+    pub fn step_reindex(&mut self, work: &mut Reindex) -> Result<bool> {
+        let end = (work.next + REINDEX_BATCH).min(work.missing.len());
+        if work.next < end {
+            let batch = &work.missing[work.next..end];
+            let texts: Vec<&str> = batch
+                .iter()
+                .map(|&i| work.chunks[i].text.as_str())
+                .collect();
+            let embs = self.model.embed(texts, None)?;
+            for (&i, e) in batch.iter().zip(embs) {
+                work.cache.embeddings.insert(work.chunks[i].hash.clone(), e);
+            }
+            work.next = end;
+        }
+        Ok(work.is_done())
+    }
+
+    /// Swap a finished [`Reindex`] in and persist the cache.
+    pub fn apply(&mut self, mut work: Reindex) -> Result<()> {
+        if !work.is_done() {
+            bail!(
+                "apply called on a reindex with {} chunks left",
+                work.remaining()
+            );
+        }
+        if !work.missing.is_empty() {
             // Prune entries whose chunk no longer exists, then persist.
             let live: std::collections::HashSet<&str> =
-                chunks.iter().map(|c| c.hash.as_str()).collect();
-            cache.embeddings.retain(|k, _| live.contains(k.as_str()));
+                work.chunks.iter().map(|c| c.hash.as_str()).collect();
+            work.cache
+                .embeddings
+                .retain(|k, _| live.contains(k.as_str()));
             let path = cache_path();
             std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, serde_json::to_vec(&cache)?)?;
+            std::fs::write(&path, serde_json::to_vec(&work.cache)?)?;
         }
-
-        let embeddings = chunks
+        let embeddings = work
+            .chunks
             .iter()
-            .map(|c| cache.embeddings[&c.hash].clone())
-            .collect();
-        Ok((chunks, embeddings))
+            .map(|c| {
+                work.cache
+                    .embeddings
+                    .get(&c.hash)
+                    .cloned()
+                    .with_context(|| format!("no embedding for {} / {}", c.file, c.heading))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.embeddings = embeddings;
+        self.chunks = work.chunks;
+        Ok(())
     }
 
     /// Like [`Self::search`] but also returns the **median** score across the

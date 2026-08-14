@@ -50,6 +50,11 @@ struct SearchArgs {
 /// is slack for a loaded machine, and it is only ever paid once.
 const DAEMON_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Deadline on the daemon answering one query. A search is ~30 ms; this is
+/// slack for a loaded machine and for waiting behind another session's query,
+/// not for waiting out a reindex.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// One query against `memq serve`, in the ungated `raw` mode: every hit with
 /// its score, formatted here rather than by the daemon's hook policy.
 fn query_daemon(query: &str, k: usize) -> Result<String> {
@@ -66,10 +71,17 @@ fn query_daemon(query: &str, k: usize) -> Result<String> {
         }
     };
 
+    // Without these the read below is unbounded, and on 2026-08-14 that is
+    // exactly what happened: the daemon was 28 minutes into a reindex, every
+    // client sat on a socket that would not be written to until it finished,
+    // and the tool call died at the harness timeout with no explanation. The
+    // reindex now yields between batches (`memq serve`), so a wait this long
+    // means something is genuinely wrong — say so instead of hanging.
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+    stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
     writeln!(stream, "{req}")?;
     stream.shutdown(std::net::Shutdown::Write)?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw)?;
+    let raw = read_answer(&mut stream)?;
     let resp: serde_json::Value =
         serde_json::from_str(raw.trim()).context("daemon sent something that is not JSON")?;
 
@@ -104,6 +116,37 @@ fn query_daemon(query: &str, k: usize) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// Read the daemon's answer to EOF, turning a stalled socket into an error a
+/// human can act on rather than a hang.
+///
+/// `read_to_string` cannot do this: with a read timeout set it fails on the
+/// first quiet moment and leaves the buffer unspecified, so partial answers
+/// would be indistinguishable from complete ones.
+fn read_answer(stream: &mut UnixStream) -> Result<String> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                bail!(
+                    "memqd did not answer within {REQUEST_TIMEOUT:?} — it is busy or wedged. \
+                     Check ~/Library/Logs/memqd.log, then retry."
+                )
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(String::from_utf8(raw)?)
 }
 
 /// Spawn `memq serve` (the sibling binary) detached and wait for its socket.
