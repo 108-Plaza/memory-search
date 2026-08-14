@@ -44,6 +44,19 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for `memq hook` / `memq <text>` waiting on the daemon.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a request will wait for an in-flight reindex before being answered
+/// from the index as it stands.
+///
+/// This is the seam between two invariants that pull opposite ways. "A memory
+/// written now is searchable now" is pinned by `scripts/freshness-test.py` and
+/// was a real user-visible bug when it broke; on an unloaded machine a
+/// person-sized write embeds in 0.2-1.0 s, so waiting buys it outright. What
+/// this refuses to buy is the pathological case — 11 s per chunk on a machine
+/// at load 157, where waiting for the whole reindex is what made a search hang
+/// for 28 minutes. Past the grace the answer is stale rather than absent, which
+/// is the trade this daemon already makes everywhere else.
+const FRESHNESS_GRACE: Duration = Duration::from_secs(3);
+
 /// Below this cosine score a hit is noise; injecting it costs context and
 /// teaches the model to ignore the block. Calibrated against the store — see
 /// `docs/HOOK.md`.
@@ -223,70 +236,25 @@ fn serve() -> Result<()> {
         // A waiting client wins, always.
         match rx.try_recv() {
             Ok(mut stream) => {
-                if let Err(e) = handle(&mut stream, &mut index, &graph) {
-                    eprintln!("memqd: request failed: {e:#}");
-                }
+                serve_one(
+                    &mut stream,
+                    &mut index,
+                    &mut graph,
+                    &mut stamp,
+                    &mut pending,
+                );
                 continue;
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => break,
         }
 
-        // Nobody waiting: start a reindex if the store moved. Stat-ing 300-odd
-        // files is ~1 ms and only happens when there is no reindex in flight.
-        if pending.is_none() {
-            let now = store_stamp();
-            if now > stamp {
-                match Index::begin_reindex(std::path::Path::new(STORE)) {
-                    Ok(work) => {
-                        eprintln!(
-                            "memqd: store changed — embedding {} chunks in the background",
-                            work.work()
-                        );
-                        pending = Some(Pending {
-                            stamp: now,
-                            started: std::time::Instant::now(),
-                            work,
-                        });
-                    }
-                    // Serving the previous index is right: stale beats silent.
-                    // `stamp` is left alone so the next pass retries.
-                    Err(e) => eprintln!(
-                        "memqd: reindex could not start ({e}); serving the previous index"
-                    ),
-                }
-            }
-        }
+        // Nobody waiting: pick up anything written since the last pass.
+        begin_if_changed(&stamp, &mut pending);
 
         // Nobody waiting and there IS work: one batch, then round again.
-        if let Some(p) = pending.as_mut() {
-            match index.step_reindex(&mut p.work) {
-                Ok(false) => {}
-                Ok(true) => {
-                    let p = pending.take().expect("just matched Some");
-                    let elapsed = p.started.elapsed();
-                    let stamp_at_start = p.stamp;
-                    match (
-                        index.apply(p.work),
-                        LinkGraph::build(std::path::Path::new(STORE)),
-                    ) {
-                        (Ok(()), Ok(g)) => {
-                            graph = g;
-                            stamp = stamp_at_start;
-                            eprintln!(
-                                "memqd: reindexed {} chunks in {:?}",
-                                index.chunks.len(),
-                                elapsed
-                            );
-                        }
-                        _ => eprintln!("memqd: reindex failed, serving the previous index"),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("memqd: reindex failed, serving the previous index: {e}");
-                    pending = None;
-                }
-            }
+        if pending.is_some() {
+            drive_reindex(&mut index, &mut graph, &mut stamp, &mut pending, None);
             continue;
         }
 
@@ -294,16 +262,123 @@ fn serve() -> Result<()> {
         // written while the machine is quiet is embedded BEFORE anyone searches
         // for it — which is the point of moving this off the request path.
         match rx.recv_timeout(IDLE_POLL) {
-            Ok(mut stream) => {
-                if let Err(e) = handle(&mut stream, &mut index, &graph) {
-                    eprintln!("memqd: request failed: {e:#}");
-                }
-            }
+            Ok(mut stream) => serve_one(
+                &mut stream,
+                &mut index,
+                &mut graph,
+                &mut stamp,
+                &mut pending,
+            ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
+}
+
+/// Start a reindex if the store has moved since `stamp`. Reads the store and
+/// the embedding cache; does no model work, so it is safe on the request path.
+fn begin_if_changed(stamp: &std::time::SystemTime, pending: &mut Option<Pending>) {
+    if pending.is_some() {
+        return;
+    }
+    let now = store_stamp();
+    if now <= *stamp {
+        return;
+    }
+    match Index::begin_reindex(std::path::Path::new(STORE)) {
+        Ok(work) => {
+            eprintln!(
+                "memqd: store changed — embedding {} chunks in the background",
+                work.work()
+            );
+            *pending = Some(Pending {
+                stamp: now,
+                started: std::time::Instant::now(),
+                work,
+            });
+        }
+        // Serving the previous index is right: stale beats silent. `stamp` is
+        // left alone so the next pass retries.
+        Err(e) => eprintln!("memqd: reindex could not start ({e}); serving the previous index"),
+    }
+}
+
+/// Answer one client, first giving any in-flight reindex up to
+/// [`FRESHNESS_GRACE`] to land so the answer includes what was just written.
+fn serve_one(
+    stream: &mut UnixStream,
+    index: &mut Index,
+    graph: &mut LinkGraph,
+    stamp: &mut std::time::SystemTime,
+    pending: &mut Option<Pending>,
+) {
+    // Re-stat before answering. Checking only when the loop finds itself idle
+    // is not enough and `freshness-test.py` says so: a client that is already
+    // queued when a memory lands gets served from the index as it was, and the
+    // change is not even noticed until the NEXT pass. Measured — the daemon
+    // path failed create, edit and delete while the MCP path, arriving a beat
+    // later, passed all three. ~1 ms against a ~30 ms query.
+    begin_if_changed(stamp, pending);
+    if pending.is_some() {
+        drive_reindex(
+            index,
+            graph,
+            stamp,
+            pending,
+            Some(std::time::Instant::now() + FRESHNESS_GRACE),
+        );
+    }
+    if let Err(e) = handle(stream, index, graph) {
+        eprintln!("memqd: request failed: {e:#}");
+    }
+}
+
+/// Push an in-flight reindex forward: to `deadline` if given, otherwise exactly
+/// one batch. Committing the result is the same either way — the swap happens
+/// only on success, so a failure leaves the previous index serving.
+fn drive_reindex(
+    index: &mut Index,
+    graph: &mut LinkGraph,
+    stamp: &mut std::time::SystemTime,
+    pending: &mut Option<Pending>,
+    deadline: Option<std::time::Instant>,
+) {
+    loop {
+        let Some(p) = pending.as_mut() else { return };
+        match index.step_reindex(&mut p.work) {
+            Ok(true) => {
+                let p = pending.take().expect("just matched Some");
+                let elapsed = p.started.elapsed();
+                let stamp_at_start = p.stamp;
+                match (
+                    index.apply(p.work),
+                    LinkGraph::build(std::path::Path::new(STORE)),
+                ) {
+                    (Ok(()), Ok(g)) => {
+                        *graph = g;
+                        *stamp = stamp_at_start;
+                        eprintln!(
+                            "memqd: reindexed {} chunks in {:?}",
+                            index.chunks.len(),
+                            elapsed
+                        );
+                    }
+                    _ => eprintln!("memqd: reindex failed, serving the previous index"),
+                }
+                return;
+            }
+            Ok(false) => match deadline {
+                Some(d) if std::time::Instant::now() < d => continue,
+                _ => return,
+            },
+            Err(e) => {
+                eprintln!("memqd: reindex failed, serving the previous index: {e:#}");
+                *pending = None;
+                return;
+            }
+        }
+    }
 }
 
 /// A background reindex in flight, with what it takes to log and commit it.

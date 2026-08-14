@@ -93,6 +93,19 @@ EXPECT = {
 }
 
 
+def mcp_content(r):
+    """Text of an MCP tool result, or a readable line when the call errored.
+
+    The server can legitimately answer with an error now — it gives up on a
+    daemon that has not replied in 20 s rather than hanging — and a KeyError
+    traceback here reads as "the harness is broken" when the harness is in fact
+    reporting correctly.
+    """
+    if "error" in r:
+        return f"MCP ERROR: {r['error'].get('message', r['error'])}"
+    return "".join(c.get("text", "") for c in r["result"]["content"])
+
+
 def hook_query(text, k):
     s = socket.socket(socket.AF_UNIX)
     s.connect(SOCK)
@@ -140,7 +153,7 @@ class Mcp:
         r = self.rpc("tools/call", {"name": "memory_search",
                                     "arguments": {"query": text, "k": k}})
         dt = (time.perf_counter() - t0) * 1000
-        return dt, "".join(c.get("text", "") for c in r["result"]["content"])
+        return dt, mcp_content(r)
 
     def close(self):
         self.p.stdin.close()
