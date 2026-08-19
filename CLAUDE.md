@@ -31,3 +31,9 @@ not fixing yet still gets an issue; deferred work with no issue is invisible wor
 Narrow exceptions: something you broke and fixed inside your own unmerged branch, or a
 typo in code being written this minute. Anything already merged, deployed, or reported by
 the owner is a bug → issue first.
+
+**Not gated here.** The `issue-link.yml` check that enforces this in the other 108
+repositories cannot run in `108-Plaza/memory-search`: its job sits `queued` forever because
+this repository is not in the org's self-hosted runner group. A workflow file that reads
+like a gate while gating nothing is worse than no file, so it is deliberately absent —
+add the repository to the runner group and it can be added.
