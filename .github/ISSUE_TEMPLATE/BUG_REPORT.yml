@@ -1,0 +1,64 @@
+name: "🐞 Bug report"
+description: Report something that is observably broken
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Search first — including closed issues.** A closed issue is the record that this
+        was already resolved once:
+        `gh issue list -R 108-Plaza/memory-search --state all --search "<keywords>"`
+
+        Standing rule: a bug gets an issue **before** the fix is written, so that
+        "what broke?" and "is it fixed?" stay answerable later.
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: What is observably wrong — the behaviour, not the suspected cause.
+      placeholder: "Uploading a rider document returns HTTP 400 with an empty body."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The shortest path from a clean state to the wrong behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: >-
+        The layer that proves it, not the layer that merely looks green — file:line,
+        commit sha, the log line, the request and its actual response.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where is this live?
+      options:
+        - production
+        - staging
+        - local / branch only
+        - not known yet
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - "🔴 money, data loss, or security"
+        - "🟠 a feature is broken"
+        - "🟢 cosmetic or minor"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything already ruled out
+      description: Related issues or PRs you searched, and what you confirmed is NOT the cause.
