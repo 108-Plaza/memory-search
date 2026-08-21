@@ -8,7 +8,7 @@ body:
       value: |
         **Search first — including closed issues.** A closed issue is the record that this
         was already resolved once:
-        `gh issue list -R 108-Plaza/memory-search --state all --search "<keywords>"`
+        `gh issue list --state all --search "<keywords>"`
 
         Standing rule: a bug gets an issue **before** the fix is written, so that
         "what broke?" and "is it fixed?" stay answerable later.
