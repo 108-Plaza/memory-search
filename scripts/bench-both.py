@@ -86,9 +86,22 @@ CASES = [
 # Measured 2026-08-11 at 278 files / 1372 chunks, MIN_SCORE 0.53. Recall is a
 # floor, not a target: raise these when a change genuinely beats them, so the
 # next change cannot quietly give it back.
+#
+# @5 re-measured 2026-08-14 at 313 files / 1591 chunks: 9 -> 8, and the one that
+# went missing is drift, not a regression. Bisected — the pre-reindex binary
+# (539108f) scores identically against this store: same misses, same ranks, same
+# top-5 lists. The whole delta is "รับเงินลูกค้าด้วยการสแกนจ่ายแยกตามสาขา", where
+# pos108-branch-promptpay now sits at rank 6 / 0.585 against a 5th place of
+# 0.585; above it is staff-reaches-a-branch-three-ways, WRITTEN 08-12, after this
+# floor was set. Drop that one file and it is rank 5 again.
+#
+# ⚠️ Expect this to keep happening. A recall floor is measured against a store of
+# a given size, and every memory written is one more competitor for five slots —
+# so a fixed number drifts red with nothing broken. Re-measure when the store
+# grows, rather than leaving a red light nobody reads.
 EXPECT = {
-    "hook@3": 7, "hook@5": 9,
-    "mcp@3": 7, "mcp@5": 9,
+    "hook@3": 7, "hook@5": 8,
+    "mcp@3": 7, "mcp@5": 8,
     "hook_false_positives": 1,  # the prose paragraph, see above
 }
 
