@@ -2,7 +2,7 @@
 //!
 //! Wire-up (project .mcp.json):
 //!   { "mcpServers": { "memory-search": {
-//!       "command": "/Users/yongyutjantaboot/108-POS/memory-search/target/release/memory-search" } } }
+//!       "command": "/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search/target/release/memory-search" } } }
 //!
 //! **This process holds no index and no model.** It is a thin client of
 //! `memq serve` over `~/.cache/memory-search/memqd.sock`, which already holds
