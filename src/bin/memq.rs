@@ -2,7 +2,7 @@
 //!
 //! The MCP tool only fires when an agent *decides* to search, and the measured
 //! failure mode is precisely that it does not feel the need to (see RULE 0 in
-//! `~/108-POS/CLAUDE.md`). This binary removes the decision: a `UserPromptSubmit`
+//! `~/IdeaProjects/108-Ting-Ecosystem/pos/CLAUDE.md`). This binary removes the decision: a `UserPromptSubmit`
 //! hook runs `memq hook` on every prompt and the top hits are injected as
 //! context before the model ever sees the turn.
 //!
@@ -23,7 +23,7 @@
 //! lookup must never be able to break the user's turn.
 
 use anyhow::{Context, Result};
-use memory_search::{socket_path, store_stamp, Index, LinkGraph, Reindex, STORE};
+use memory_search::{socket_path, store_stamp, Index, LinkGraph, Reindex, WarmCache, STORE};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
@@ -232,6 +232,9 @@ fn serve() -> Result<()> {
     // what changed is that it now happens in the GAPS between requests, a batch
     // at a time, and a waiting client always preempts it.
     let mut pending: Option<Pending> = None;
+    // Outlives any single pass: embeddings from a pass that was abandoned and
+    // whose replacement could not start yet.
+    let mut carried: Option<Carried> = None;
     loop {
         // A waiting client wins, always.
         match rx.try_recv() {
@@ -242,6 +245,7 @@ fn serve() -> Result<()> {
                     &mut graph,
                     &mut stamp,
                     &mut pending,
+                    &mut carried,
                 );
                 continue;
             }
@@ -250,7 +254,7 @@ fn serve() -> Result<()> {
         }
 
         // Nobody waiting: pick up anything written since the last pass.
-        begin_if_changed(&stamp, &mut pending);
+        begin_if_changed(&stamp, &mut pending, &mut carried);
 
         // Nobody waiting and there IS work: one batch, then round again.
         if pending.is_some() {
@@ -268,6 +272,7 @@ fn serve() -> Result<()> {
                 &mut graph,
                 &mut stamp,
                 &mut pending,
+                &mut carried,
             ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -276,30 +281,67 @@ fn serve() -> Result<()> {
     Ok(())
 }
 
-/// Start a reindex if the store has moved since `stamp`. Reads the store and
-/// the embedding cache; does no model work, so it is safe on the request path.
-fn begin_if_changed(stamp: &std::time::SystemTime, pending: &mut Option<Pending>) {
-    if pending.is_some() {
-        return;
-    }
+/// Start a reindex if there is one to start: the store has moved since `stamp`,
+/// a pass in flight has been overtaken by a newer store, or an earlier attempt
+/// failed and left its embeddings in `carried`.
+///
+/// An overtaken pass is abandoned rather than finished — completing it installs
+/// a snapshot that is already out of date, which is how a memory deleted
+/// mid-reindex kept answering. Its embeddings and its clock move to the
+/// replacement, so the restart costs no model work and stays honest about how
+/// long the whole chain has run.
+///
+/// Reads the store and the embedding cache; does no model work, so it is safe
+/// on the request path.
+fn begin_if_changed(
+    stamp: &std::time::SystemTime,
+    pending: &mut Option<Pending>,
+    carried: &mut Option<Carried>,
+) {
     let now = store_stamp();
-    if now <= *stamp {
-        return;
+    if let Some(p) = pending.as_ref() {
+        if now <= p.stamp {
+            return; // in flight and still current
+        }
+        let p = pending.take().expect("just matched Some");
+        *carried = Some(Carried {
+            cache: Some(p.work.into_warm()),
+            started: p.started,
+            restarts: p.restarts + 1,
+        });
+    } else if carried.is_none() && now <= *stamp {
+        return; // nothing in flight, nothing owed, nothing new
     }
-    match Index::begin_reindex(std::path::Path::new(STORE)) {
+
+    let begun = match carried.as_mut() {
+        Some(c) => Index::begin_reindex_with(std::path::Path::new(STORE), &mut c.cache),
+        None => Index::begin_reindex(std::path::Path::new(STORE)),
+    };
+    match begun {
         Ok(work) => {
             eprintln!(
                 "memqd: store changed — embedding {} chunks in the background",
                 work.work()
             );
+            // Adopt the abandoned pass's clock, or start one if this is the
+            // head of the chain.
+            let (started, restarts) = match carried.take() {
+                Some(c) => (c.started, c.restarts),
+                None => (std::time::Instant::now(), 0),
+            };
             *pending = Some(Pending {
                 stamp: now,
-                started: std::time::Instant::now(),
+                started,
+                restarts,
                 work,
             });
         }
         // Serving the previous index is right: stale beats silent. `stamp` is
-        // left alone so the next pass retries.
+        // left alone so the next pass retries, and `carried` still holds the
+        // embeddings — `begin_reindex_with` takes them only once the store has
+        // actually been read, so a failed start costs nothing but the attempt.
+        // It used to cost the whole pass: the cache was surrendered before the
+        // outcome was known, and nothing had persisted it.
         Err(e) => eprintln!("memqd: reindex could not start ({e}); serving the previous index"),
     }
 }
@@ -312,6 +354,7 @@ fn serve_one(
     graph: &mut LinkGraph,
     stamp: &mut std::time::SystemTime,
     pending: &mut Option<Pending>,
+    carried: &mut Option<Carried>,
 ) {
     // Re-stat before answering. Checking only when the loop finds itself idle
     // is not enough and `freshness-test.py` says so: a client that is already
@@ -319,7 +362,7 @@ fn serve_one(
     // change is not even noticed until the NEXT pass. Measured — the daemon
     // path failed create, edit and delete while the MCP path, arriving a beat
     // later, passed all three. ~1 ms against a ~30 ms query.
-    begin_if_changed(stamp, pending);
+    begin_if_changed(stamp, pending, carried);
     if pending.is_some() {
         drive_reindex(
             index,
@@ -350,6 +393,7 @@ fn drive_reindex(
             Ok(true) => {
                 let p = pending.take().expect("just matched Some");
                 let elapsed = p.started.elapsed();
+                let restarts = p.restarts;
                 let stamp_at_start = p.stamp;
                 match (
                     index.apply(p.work),
@@ -359,9 +403,13 @@ fn drive_reindex(
                         *graph = g;
                         *stamp = stamp_at_start;
                         eprintln!(
-                            "memqd: reindexed {} chunks in {:?}",
+                            "memqd: reindexed {} chunks in {:?}{}",
                             index.chunks.len(),
-                            elapsed
+                            elapsed,
+                            match restarts {
+                                0 => String::new(),
+                                n => format!(" (restarted {n}x)"),
+                            }
                         );
                     }
                     _ => eprintln!("memqd: reindex failed, serving the previous index"),
@@ -383,11 +431,33 @@ fn drive_reindex(
 
 /// A background reindex in flight, with what it takes to log and commit it.
 struct Pending {
-    /// The store stamp the work was started from — committed only on success,
-    /// so a write that lands mid-reindex is picked up on the next pass.
+    /// The store stamp this pass read the store at, committed only on success.
+    /// A write that lands past it does not wait for the next pass: this one is
+    /// abandoned and restarted from the newer store, carrying its embeddings
+    /// along — see [`begin_if_changed`].
     stamp: std::time::SystemTime,
+    /// When the FIRST pass in this chain started, not this one. Restarts are
+    /// driven by store writes, so restarting the clock with them under-reports
+    /// the wait exactly when it is longest — and this log is the only
+    /// instrument for the 1685 s case described above.
     started: std::time::Instant,
+    /// How many times this chain has been abandoned and restarted. Kept apart
+    /// from `started` so the log can say both.
+    restarts: usize,
     work: Reindex,
+}
+
+/// An abandoned pass's embeddings and clock, waiting to be adopted by its
+/// replacement. Lives in [`serve`] rather than inside [`begin_if_changed`] so
+/// that a start which fails leaves it here for the next attempt instead of
+/// dropping it — `Index::apply` is the only thing that persists, and a pass
+/// that never starts never reaches it.
+struct Carried {
+    /// `None` only for the instant between a successful `begin_reindex_with`
+    /// taking it and the caller taking the rest of this struct.
+    cache: Option<WarmCache>,
+    started: std::time::Instant,
+    restarts: usize,
 }
 
 fn handle(stream: &mut UnixStream, index: &mut Index, graph: &LinkGraph) -> Result<()> {
