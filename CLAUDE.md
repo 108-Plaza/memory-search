@@ -12,7 +12,7 @@ Before writing a fix, search — **including closed issues**, because a closed o
 record that this was already resolved:
 
 ```
-gh issue list -R 108-Plaza/memory-search --state all --search "<symptom keywords>"
+gh issue list --state all --search "<symptom keywords>"
 ```
 
 If there is none, open one **in the repo where the PR will merge** (`Fixes #N` only
