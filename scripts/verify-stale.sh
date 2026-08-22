@@ -18,7 +18,7 @@
 set -uo pipefail   # ไม่ใช้ -e: การเช็คที่ล้มเป็นเรื่องปกติ ต้องรายงานไม่ใช่ตาย
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STORE="$HOME/.claude/shared-memory/pos108"
-WS="$HOME/108-POS"
+WS="$HOME/IdeaProjects/108-Ting-Ecosystem"   # ย้ายมาจาก ~/108-POS (2026-08-21)
 OUT="$DIR/proposals"
 N="${1:-12}"
 mkdir -p "$OUT"
@@ -36,13 +36,19 @@ repo_of() {
     sell)              echo "108-Plaza/pos108-sell" ;;
     media)             echo "108-Plaza/Media-Platform" ;;
     platform-services) echo "108-Plaza/108-platform-services" ;;
+    services)          echo "108-Plaza/108-platform-services" ;;   # ชื่อใหม่ใต้ platform/
+    api)               echo "108-Plaza/api-108jobs" ;;             # jobs/api
+    web)               echo "108-Plaza/108jobs-web" ;;             # jobs/web
+    mobile)            echo "108-Plaza/108jobs-flutter" ;;         # jobs/mobile
+    recognize)         echo "108-Plaza/Recognize-Platform" ;;
+    payment)           echo "108-Plaza/Payment-Platform" ;;
     *)                 echo "" ;;
   esac
 }
 
 # หมุนชุดที่ตรวจตามวันของปี — 12 ไฟล์/คืน ครบ 256 ไฟล์ในราว 3 สัปดาห์
 # (เรียงชื่อคงที่ + offset เลื่อนทุกวัน ⇒ ครอบคลุมทั่วถึงโดยไม่ต้องเก็บ state)
-ALL=$(ls "$STORE"/*.md | grep -v '/MEMORY.md$' | grep -v -- '-history.md$' | sort)
+ALL=$(ls "$STORE"/*.md | grep -v '/MEMORY.md$' | grep -v '/CLAUDE.md$' | grep -v -- '-history.md$' | sort)
 TOTAL=$(echo "$ALL" | wc -l | tr -d ' ')
 OFFSET=$(( ($(date +%j) * N) % TOTAL ))
 FILES=$(echo "$ALL" | awk -v o="$OFFSET" -v n="$N" -v t="$TOTAL" \
@@ -64,7 +70,9 @@ trap 'rm -f "$TRACKED"' EXIT
 # ว่า "ไม่มีอยู่ในรีโปไหนแล้ว" ทั้งที่อยู่บน main ครบ — เป็นกับดักเดียวกับ
 # memory `root-checkout-files-are-stale` · union กันไว้ ปลอดภัยกว่าเลือกข้างใดข้างหนึ่ง
 # (ของที่ยังอยู่แค่ในบรานช์ที่ทำงานอยู่ก็ไม่ถูกแจ้งผิด)
-for d in "$WS"/*/ "$HOME"/IdeaProjects/*/; do
+# ⚠️ รีโปอยู่ลึกสองชั้นแล้ว ($WS/{pos,platform,jobs}/<name>) — ถ้าไล่แค่ "$WS"/*/
+# จะเจอแต่โฟลเดอร์กลุ่มซึ่งไม่ใช่ git repo แล้วเงียบไปทั้งชุด
+for d in "$WS"/*/ "$WS"/*/*/ "$HOME"/IdeaProjects/*/; do
   [ -d "$d/.git" ] || continue
   name=$(basename "$d")
   (
@@ -168,10 +176,10 @@ for f in $FILES; do
 
     # เฉพาะ core: merged ≠ ถึงร้านจริง — prod เดินด้วย release/prod เท่านั้น
     # นี่คือคลาสที่กัดจริงเมื่อ 2026-08-09 (#833 merged แต่ยังไม่ถึง 8 ร้าน)
-    if [ "$state" = "MERGED" ] && [ "$slug" = "core" ] && [ -d "$WS/core/.git" ]; then
+    if [ "$state" = "MERGED" ] && [ "$slug" = "core" ] && [ -d "$WS/pos/core/.git" ]; then
       sha=$(gh pr view "$num" --repo "$repo" --json mergeCommit --jq .mergeCommit.oid 2>/dev/null)
-      if [ -n "$sha" ] && git -C "$WS/core" cat-file -e "$sha^{commit}" 2>/dev/null; then
-        if ! git -C "$WS/core" merge-base --is-ancestor "$sha" origin/release/prod 2>/dev/null; then
+      if [ -n "$sha" ] && git -C "$WS/pos/core" cat-file -e "$sha^{commit}" 2>/dev/null; then
+        if ! git -C "$WS/pos/core" merge-base --is-ancestor "$sha" origin/release/prod 2>/dev/null; then
           body="$body
 - ⚠️ **core#$num merged แต่ยังไม่อยู่บน \`origin/release/prod\`** — ร้านจริงยังไม่ได้ของนี้"
           FINDINGS=$((FINDINGS+1))
@@ -313,7 +321,7 @@ def desc(front):
 
 out, n = [], 0
 files = [f for f in sorted(glob.glob(os.path.join(store, '*.md')))
-         if not f.endswith(('MEMORY.md',)) and not f.endswith('-history.md')]
+         if not f.endswith(('MEMORY.md', 'CLAUDE.md')) and not f.endswith('-history.md')]
 
 # ── 3. description ตามเนื้อไฟล์ไม่ทัน ──────────────────────────────────────
 # hub ไม่เข้าเกณฑ์นี้: description ของมันบรรยาย *ดัชนี* ไม่ใช่คำกล่าวอ้างเรื่องใดเรื่องหนึ่ง

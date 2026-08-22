@@ -92,12 +92,18 @@ fi
 # (`-108-POS-core--claude-worktrees-*` ฯลฯ) รวมแล้วมองไม่เห็นไป 15 ไฟล์
 # แบบ prefix นี้ครอบ checkout/worktree ใหม่ที่จะเกิดขึ้นอีกโดยไม่ต้องมาแก้สคริปต์
 #
-# ที่ไม่รวมโดยตั้งใจ: -IdeaProjects* และ -108-Ting-Ecosystem* — คนละ memory store
-# (ดู memory `memory-store-unified`) prefix ข้างล่างกันสองอันนี้ออกอยู่แล้ว
+# ⚠️ 2026-08-22: รีโป pos108 **ย้ายไป ~/IdeaProjects/108-Ting-Ecosystem/ แล้ว** และ
+# ~/108-POS หายไป ⇒ งานส่วนใหญ่ไปอยู่ dir `-Users-...-IdeaProjects-108-Ting-Ecosystem*`
+# (7 วันล่าสุด: 35 transcript ที่นั่น เทียบกับที่ -108-POS* เห็นได้น้อยกว่ามาก)
+# จึงเพิ่ม prefix นั้นเข้ามา ไม่งั้น miner จะรายงาน "ไม่มี transcript ใหม่" ไปเรื่อย ๆ
+# โดยไม่ error — เหตุผลเดิมที่กันไว้ ("คนละ memory store") เขียนตอน pos108 ยังอยู่ ~/108-POS
+# ยังคงกัน -IdeaProjects* ตัวอื่น (108jobs-flutter ฯลฯ) ออกเหมือนเดิม
 DIRS=()
 while IFS= read -r d; do DIRS+=("$(basename "$d")"); done < <(
   find "$PROJ" -maxdepth 1 -type d \
-    \( -name '-Users-yongyutjantaboot-108-POS*' -o -name '-Users-yongyutjantaboot' \) \
+    \( -name '-Users-yongyutjantaboot-108-POS*' \
+       -o -name '-Users-yongyutjantaboot-IdeaProjects-108-Ting-Ecosystem*' \
+       -o -name '-Users-yongyutjantaboot' \) \
     2>/dev/null | sort
 )
 [ ${#DIRS[@]} -eq 0 ] && { echo "หา launch dir ไม่เจอเลย — ตรวจ \$PROJ" >&2; exit 1; }
