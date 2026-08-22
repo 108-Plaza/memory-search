@@ -258,7 +258,14 @@ fn serve() -> Result<()> {
 
         // Nobody waiting and there IS work: one batch, then round again.
         if pending.is_some() {
-            drive_reindex(&mut index, &mut graph, &mut stamp, &mut pending, None);
+            drive_reindex(
+                &mut index,
+                &mut graph,
+                &mut stamp,
+                &mut pending,
+                &mut carried,
+                None,
+            );
             continue;
         }
 
@@ -369,6 +376,7 @@ fn serve_one(
             graph,
             stamp,
             pending,
+            carried,
             Some(std::time::Instant::now() + FRESHNESS_GRACE),
         );
     }
@@ -385,6 +393,7 @@ fn drive_reindex(
     graph: &mut LinkGraph,
     stamp: &mut std::time::SystemTime,
     pending: &mut Option<Pending>,
+    carried: &mut Option<Carried>,
     deadline: Option<std::time::Instant>,
 ) {
     loop {
@@ -412,6 +421,14 @@ fn drive_reindex(
                             }
                         );
                     }
+                    // Not carried, deliberately, unlike the step failure
+                    // below. `Index::apply` writes the cache to disk BEFORE it
+                    // can fail any other way, so a failure past that point has
+                    // already persisted the embeddings and the next pass reads
+                    // them back; a `LinkGraph::build` failure comes after a
+                    // successful apply and loses nothing at all. What is left
+                    // is a failing cache WRITE, and carrying an in-memory cache
+                    // past a disk that will not take it only defers the loss.
                     _ => eprintln!("memqd: reindex failed, serving the previous index"),
                 }
                 return;
@@ -422,7 +439,28 @@ fn drive_reindex(
             },
             Err(e) => {
                 eprintln!("memqd: reindex failed, serving the previous index: {e:#}");
-                *pending = None;
+                // Serving the previous index is right — stale beats silent —
+                // but dropping `pending` here also dropped every embedding
+                // this chain had computed, including any inherited across an
+                // earlier restart. `Index::apply` is the only thing that
+                // persists and this path never reaches it, so at ~11 s/chunk a
+                // chain 40 deep paid ~7 minutes of model work for one
+                // transient failure and re-embedded all of it next pass (#6).
+                //
+                // Hand the work to the next attempt exactly as an overtaken
+                // pass does. `begin_if_changed` starts a replacement on the
+                // strength of `carried` alone, so this resumes even if the
+                // store has not moved since.
+                let p = pending.take().expect("just matched Some");
+                *carried = Some(Carried {
+                    cache: Some(p.work.into_warm()),
+                    started: p.started,
+                    // A failure abandons the chain as surely as an overtaking
+                    // write does, and the log reads "(restarted 3x)" off this
+                    // — counting it is what keeps that number honest about how
+                    // many attempts a long wait actually cost.
+                    restarts: p.restarts + 1,
+                });
                 return;
             }
         }
