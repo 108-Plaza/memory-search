@@ -350,9 +350,31 @@ pub struct Reindex {
     /// Indices into `chunks` that the cache has no embedding for.
     missing: Vec<usize>,
     next: usize,
+    /// Whether `cache` holds embeddings `cache_path()` does not. Set by
+    /// [`Index::step_reindex`], and inherited across a restart by
+    /// [`Self::into_warm`] — see the guard in [`Index::apply`], which is the
+    /// only thing that ever writes.
+    dirty: bool,
+}
+
+/// The embedding cache handed from an abandoned [`Reindex`] to its replacement.
+///
+/// The `dirty` half is what the cache cannot say about itself: whether anything
+/// in it is still owed to disk. A replacement pass inherits the embeddings *and*
+/// the obligation to write them out.
+pub struct WarmCache {
+    cache: Cache,
+    dirty: bool,
 }
 
 impl Reindex {
+    /// Give up the work-in-progress cache so a restart keeps what it embedded.
+    pub fn into_warm(self) -> WarmCache {
+        WarmCache {
+            cache: self.cache,
+            dirty: self.dirty,
+        }
+    }
     pub fn remaining(&self) -> usize {
         self.missing.len().saturating_sub(self.next)
     }
@@ -452,11 +474,37 @@ impl Index {
     /// Read the store and work out what is missing from the embedding cache.
     /// Does no model work, so it is safe to call on the request path.
     pub fn begin_reindex(store: &Path) -> Result<Reindex> {
-        let chunks = chunk_store(store)?;
         let cache: Cache = std::fs::read(cache_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        // Straight off the disk, so nothing in it is owed back to the disk.
+        let mut warm = Some(WarmCache {
+            cache,
+            dirty: false,
+        });
+        Self::begin_reindex_with(store, &mut warm)
+    }
+
+    /// Same, but starting from a cache already in hand — the one an abandoned
+    /// [`Reindex`] was holding. A pass reads the store ONCE at the start, so if
+    /// the store moves again while it is embedding, finishing it installs a
+    /// snapshot that is already wrong (measured: a deleted memory still
+    /// answering, 2026-08-14). Restarting is the fix, and restarting is only
+    /// affordable if the chunks already embedded come along — they live in that
+    /// cache and are not written to disk until `apply`.
+    ///
+    /// Takes the cache out of `warm` only once the store has been read, so a
+    /// failure here costs nothing. `chunk_store` fails on ordinary, recoverable
+    /// things — a memory being rewritten under us, a file that is not UTF-8 —
+    /// and on the error path the caller has nowhere else to put those
+    /// embeddings: `apply` is the only thing that persists, and a pass that
+    /// fails to start never reaches it.
+    pub fn begin_reindex_with(store: &Path, warm: &mut Option<WarmCache>) -> Result<Reindex> {
+        let chunks = chunk_store(store)?;
+        let WarmCache { cache, dirty } = warm
+            .take()
+            .context("begin_reindex_with called with no cache in hand")?;
         let missing = chunks
             .iter()
             .enumerate()
@@ -468,6 +516,7 @@ impl Index {
             cache,
             missing,
             next: 0,
+            dirty,
         })
     }
 
@@ -486,6 +535,10 @@ impl Index {
                 work.cache.embeddings.insert(work.chunks[i].hash.clone(), e);
             }
             work.next = end;
+            // These exist only in `work.cache` until `apply` writes it out —
+            // including if this pass is abandoned and a replacement inherits
+            // them, which is why the flag travels with the cache.
+            work.dirty = true;
         }
         Ok(work.is_done())
     }
@@ -498,7 +551,15 @@ impl Index {
                 work.remaining()
             );
         }
-        if !work.missing.is_empty() {
+        // `dirty`, not `missing`. Gating on this pass's own `missing` was safe
+        // only while a pass could not inherit work: a restarted pass can finish
+        // with nothing missing — every chunk of the new snapshot already in the
+        // cache it was handed — and still be holding embeddings no one has
+        // written. That skipped the write entirely, and a delete-only pass
+        // after a partial one silently cost the whole partial pass, re-embedded
+        // on the next daemon start. `dirty` covers the old case too: a pass
+        // with anything in `missing` has to have stepped to get here.
+        if work.dirty {
             // Prune entries whose chunk no longer exists, then persist.
             let live: std::collections::HashSet<&str> =
                 work.chunks.iter().map(|c| c.hash.as_str()).collect();
