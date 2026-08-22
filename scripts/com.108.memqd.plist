@@ -17,7 +17,12 @@
 
   KeepAlive restarts it if it dies or is killed. It does NOT need a file
   watcher: the daemon re-stats the store on each request and reindexes itself
-  when a memory changes (see store_stamp() in src/bin/memq.rs).
+  when a memory changes (see store_stamp() in src/lib.rs).
+
+  So a request is not always just a search. If a reindex is in flight, the
+  daemon drives it for up to FRESHNESS_GRACE (3 s) before answering, so that a
+  memory written a moment ago is searchable now. A query that blocks for a
+  couple of seconds right after a write is that, not a hang.
 
   Paths are absolute because launchd expands neither ~ nor $HOME.
 -->
@@ -28,7 +33,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/yongyutjantaboot/108-POS/memory-search/target/release/memq</string>
+        <string>/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search/target/release/memq</string>
         <string>serve</string>
     </array>
 
@@ -48,6 +53,6 @@
     <string>/Users/yongyutjantaboot/Library/Logs/memqd.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/yongyutjantaboot/108-POS/memory-search</string>
+    <string>/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search</string>
 </dict>
 </plist>
