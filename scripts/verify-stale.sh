@@ -257,7 +257,7 @@ for f in $FILES; do
   fi
 done
 
-# ── 3-5. ความสอดคล้องของ "บรรทัดสรุป" กับตัวไฟล์ ────────────────────────────
+# ── 3-6. ความสอดคล้องของ "บรรทัดสรุป" กับตัวไฟล์ + การเดินถึงกันของลิงก์ ─────
 #
 # คลาสนี้เพิ่มเมื่อ 2026-08-09 หลังพลาดสองครั้งในงานเดียว ตอนย่อ 118 memory ลงเป็น hub:
 # ทั้งสองครั้งคือ **หยิบพาดหัวเดิมมาโดยไม่อ่านต่อ** — `pos108-kitchen-print-realtime`
@@ -437,17 +437,72 @@ else:
                    f"(ไม่ได้อยู่ในดัชนีและไม่มี hub ไหนชี้ตรง) — **เทียบเอง**")
         n += 1
 
+# ── 6. ลิงก์ตาย — ปลายทางที่ไม่มีไฟล์อยู่จริง (ด้านกลับของด่านที่ 5) ──────────
+# ด่านที่ 5 ถามว่า "เดินมาถึงไฟล์นี้ได้ไหม" ด่านนี้ถามว่า "ลิงก์ที่เขียนไว้ พาไปถึงอะไรไหม"
+# ลิงก์ตายคือรอยที่ขาดกลางทาง: คนตามมาเห็นชื่อ slug แต่ไม่มีไฟล์ แล้วแยกไม่ออกว่าถูกลบ
+# ถูกเปลี่ยนชื่อ หรือไม่เคยมีใครเขียน — เสียหายแบบเดียวกับไฟล์กำพร้า แค่มองจากอีกด้าน
+#
+# ⚠️ สองด่านกรองที่ขาดไม่ได้ ไม่งั้นรายงานเป็นขยะ (issue #13):
+#   1. **ข้ามลิงก์ที่อยู่ในโค้ด** ทั้ง fenced block และ inline span — สโตร์นี้อธิบายธรรมเนียม
+#      ของตัวเอง `[[wikilink]]` / `[[name]]` จึงโผล่ในฐานะ *ตัวอย่าง* · syntax ของ Cargo
+#      กับ deny.toml (`[[bin]]`, `[[test]]`, `[[bans.deny]]`) ก็หน้าตาเหมือนกันเป๊ะ ·
+#      และ `[[audit-fix-merge]]` ใน rule-issue-before-fixing-a-bug คือชื่อ **skill** ไม่ใช่ memory
+#   2. **ปลายทางของ wikilink ต้องมีรูปทรงของ slug** — kebab-case ไม่มีจุด ⇒ ตัด
+#      `[[bin]]`/`[[test]]` ที่โผล่ในเนื้อความ (ไม่ได้อยู่ใน backtick) ออก
+# markdown link ไม่ต้องกรองรูปทรง เพราะมันเขียน `.md` มาเองอยู่แล้ว
+#
+# ⚠️ จงใจเข้มกว่าด่านที่ 5: ด่าน 5 นับลิงก์ *ทุกที่* (ใจกว้าง ⇒ ไม่แจ้งกำพร้าผิด)
+# ด่านนี้ตัดลิงก์ในโค้ดทิ้ง (เข้ม ⇒ ไม่แจ้งลิงก์ตายผิด) — ผิดคนละทิศกัน จึงกรองคนละแบบ
+FENCED  = re.compile(r'(?s)```.*?```')
+INLINE  = re.compile(r'`[^`\n]*`')
+SLUG    = re.compile(r'^(?=.*-)[a-z0-9][a-z0-9-]{6,}$')
+
+dead = {}
+for f in sorted(glob.glob(os.path.join(store, '*.md'))):
+    try:
+        raw = open(f, encoding='utf-8').read()
+    except OSError:
+        continue
+    prose = INLINE.sub(' ', FENCED.sub(' ', raw))
+    targets  = {t for t in WIKI_LINK.findall(prose) if SLUG.match(t)}
+    targets |= set(MD_LINK.findall(prose))
+    for t in targets:
+        if not os.path.exists(os.path.join(store, t + '.md')):
+            dead.setdefault(t, []).append(os.path.basename(f))
+
+# เดาปลายทางที่น่าจะใช่ จาก slug ที่ขึ้นต้นเหมือนกัน (เปลี่ยนชื่อไฟล์มักเหลือ prefix เดิม)
+# ใช้ prefix ไม่ใช่ fuzzy match: fuzzy ที่หลวมพอจะเจอของจริงก็เดามั่วในเคสอื่นทันที
+store_names = sorted(os.path.basename(f)[:-3] for f in glob.glob(os.path.join(store, '*.md')))
+def rename_hint(target):
+    segs = target.split('-')
+    for k in (3, 2):
+        if len(segs) > k:
+            pre = '-'.join(segs[:k]) + '-'
+            near = [nm for nm in store_names if nm.startswith(pre)]
+            if near:
+                return near[:3]
+    return []
+
+for t in sorted(dead):
+    srcs = sorted(set(dead[t]))
+    hint = rename_hint(t)
+    hint_txt = (" · น่าจะเปลี่ยนชื่อเป็น " + ", ".join(f"`{h}`" for h in hint)) if hint else ""
+    out.append(f"- 🟠 `[[{t}]]` — **ปลายทางไม่มีไฟล์อยู่จริง** ถูกชี้จาก "
+               + ", ".join(f"`{x}`" for x in srcs[:4])
+               + (f" (+{len(srcs)-4} ไฟล์)" if len(srcs) > 4 else "") + hint_txt)
+    n += 1
+
 with open(report, 'a', encoding='utf-8') as fh:
-    fh.write("\n## บรรทัดสรุป (description / hub) และไฟล์กำพร้า\n\n")
+    fh.write("\n## บรรทัดสรุป (description / hub) · ไฟล์กำพร้า · ลิงก์ตาย\n\n")
     fh.write(("\n".join(out) if out else
               f"ตรวจ {len(files)} ไฟล์ + hub {len(hubs)} ตัว — description ตรงกับเนื้อไฟล์ "
-              "ทุกตัว, บรรทัด hub ไม่ขัดกับปลายทาง, ไม่มีไฟล์กำพร้า") + "\n")
+              "ทุกตัว, บรรทัด hub ไม่ขัดกับปลายทาง, ไม่มีไฟล์กำพร้า, ไม่มีลิงก์ตาย") + "\n")
 print(n)
 PY
 SUMMARY_FINDINGS=$(python3 - "$REPORT" <<'PY'
 import re,sys
 t=open(sys.argv[1],encoding='utf-8').read()
-sec=t.split('## บรรทัดสรุป (description / hub) และไฟล์กำพร้า',1)
+sec=t.split('## บรรทัดสรุป (description / hub) · ไฟล์กำพร้า · ลิงก์ตาย',1)
 print(len(re.findall(r'(?m)^- [🔴🟡🟠]', sec[1])) if len(sec)>1 else 0)
 PY
 )
@@ -463,7 +518,7 @@ FINDINGS=$((FINDINGS + SUMMARY_FINDINGS))
   echo "| ไฟล์ที่ตรวจ (PR/path) | $N |"
   echo "| PR ที่ยืนยันกับ GitHub | $CHECKED_PR |"
   echo "| path ที่เช็คการมีอยู่ | $CHECKED_PATH |"
-  echo "| description + hub + กำพร้า (ตรวจทั้งสโตร์) | $SUMMARY_FINDINGS |"
+  echo "| description + hub + กำพร้า + ลิงก์ตาย (ตรวจทั้งสโตร์) | $SUMMARY_FINDINGS |"
   echo "| **เรื่องที่ต้องดู** | **$FINDINGS** |"
   echo
   if [ "$FINDINGS" -eq 0 ]; then
