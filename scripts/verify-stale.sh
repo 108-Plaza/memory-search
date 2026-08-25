@@ -17,7 +17,8 @@
 
 set -uo pipefail   # ไม่ใช้ -e: การเช็คที่ล้มเป็นเรื่องปกติ ต้องรายงานไม่ใช่ตาย
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-STORE="$HOME/.claude/shared-memory/pos108"
+# ตั้ง MEMORY_STORE ได้เพื่อทดสอบด่านต่าง ๆ กับสโตร์จำลอง — ปกติไม่ต้องตั้ง
+STORE="${MEMORY_STORE:-$HOME/.claude/shared-memory/pos108}"
 WS="$HOME/IdeaProjects/108-Ting-Ecosystem"   # ย้ายมาจาก ~/108-POS (2026-08-21)
 OUT="$DIR/proposals"
 N="${1:-12}"
@@ -272,7 +273,7 @@ done
 # ยังเป็นการตรวจด้วยเครื่องล้วน: ถามแค่ "ไฟล์ประกาศว่าจบแล้วหรือห้ามรายงานซ้ำไหม
 # และบรรทัดสรุปพูดตรงกันไหม" ไม่ได้ให้ใครตีความว่าเนื้อหาถูกหรือผิด
 python3 - "$STORE" "$REPORT" <<'PY' >> /dev/null
-import re, sys, glob, os
+import re, sys, glob, os, collections
 store, report = sys.argv[1], sys.argv[2]
 
 # เครื่องหมาย "เรื่องนี้จบแล้ว"
@@ -385,16 +386,56 @@ for h in hubs:
                     n += 1
 
 # ── 5. ไฟล์ที่ไม่มีใครชี้ถึง — สาเหตุตรง ๆ ของการรื้อสร้างงานซ้ำ 2026-08-09 ────
-idx = open(os.path.join(store, 'MEMORY.md'), encoding='utf-8').read()
-reach = set(re.findall(r'\]\(([A-Za-z0-9._-]+)\.md\)', idx))
-for h in hubs:
-    reach |= set(re.findall(r'\[\[([A-Za-z0-9._-]+)\]\]', open(h, encoding='utf-8').read()))
-    reach.add(os.path.basename(h)[:-3])
-orphan = sorted(os.path.basename(f)[:-3] for f in files if os.path.basename(f)[:-3] not in reach)
-for o in orphan:
-    out.append(f"- 🔴 `{o}.md` — **ไม่มีบรรทัดใน MEMORY.md และไม่มี hub ไหนชี้ถึง** "
-               f"(เซสชันที่ไม่ได้ยิงค้นจะไม่มีทางรู้ว่ามีไฟล์นี้)")
+# คำถามจริงคือ "เซสชันที่ไม่ยิง memory_search เดินไปถึงไฟล์นี้ได้ไหม" — `MEMORY.md` ถูกโหลด
+# ทุกเซสชัน จึงเป็นจุดตั้งต้น แล้ว **เดินตามลิงก์ต่อทอด** ไปเรื่อย ๆ ไม่ใช่ดูแค่หนึ่งทอด
+#
+# ⚠️ สามคลาสที่เวอร์ชันก่อนแจ้งผิด (ทั้งหมดคือไฟล์ที่ *มี* คนชี้ถึงจริง) — #11:
+#   1. `MEMORY.md` เขียนบรรทัดเป็น `[[wikilink]]` (เดิมนับเฉพาะ markdown link ในไฟล์นี้)
+#   2. ลิงก์แบบมี alias `[[slug|ข้อความ]]` — regex เดิมไม่แมตช์เลยทั้งใน hub และ index
+#   3. ไฟล์ที่ถูกชี้จาก memory ธรรมดาที่ตัวมันเองอยู่ใน `MEMORY.md` (เดิมอ่านแค่ hub)
+# รอบ 08-22 กับ 08-24 แก้ *สโตร์* ให้เข้ากับ regex ไปแล้วสองครั้ง (แปลงลิงก์ 82+ บรรทัด)
+# ทั้งที่ตัวที่ผิดคือด่านนี้ — อย่าแก้สโตร์ให้เข้ากับเครื่องมืออีก
+WIKI_LINK = re.compile(r'\[\[([A-Za-z0-9._-]+?)(?:\|[^\]\n]*)?\]\]')   # [[slug]] และ [[slug|alias]]
+MD_LINK   = re.compile(r'\]\(([A-Za-z0-9._-]+)\.md\)')
+
+def links_in(path):
+    try:
+        text = open(path, encoding='utf-8').read()
+    except OSError:
+        return set()
+    return set(WIKI_LINK.findall(text)) | set(MD_LINK.findall(text))
+
+# BFS จาก MEMORY.md · depth = จำนวนทอดที่ต้องเดินจากดัชนี (hub = 1, ไฟล์ใต้ hub = 2)
+depth = {'MEMORY': 0}
+queue = collections.deque(['MEMORY'])
+while queue:
+    cur = queue.popleft()
+    for target in links_in(os.path.join(store, cur + '.md')):
+        if target not in depth:
+            depth[target] = depth[cur] + 1
+            queue.append(target)
+
+names = [os.path.basename(f)[:-3] for f in files]
+
+# ── ด่านกันตัวเองพัง: ผลของด่านนี้เชื่อได้ต่อเมื่อ BFS เดินออกไปได้จริง ──────────
+# บทเรียน 2026-08-14 (bug 3 ของรอบนั้น): ผลที่ผิดทั้งแผงหน้าตาเหมือนผลจริงทุกประการ
+# ถ้าเดินได้ไม่ถึงครึ่งสโตร์ แปลว่าดัชนีอ่านไม่ได้/รูปแบบลิงก์เปลี่ยน ⇒ **ห้ามลิสต์กำพร้า**
+# เพราะทุกบรรทัดจะผิด — รายงานที่ผิดทั้งแผงแย่กว่าไม่มีรายงาน
+if len(depth) < len(names) // 2:
+    out.append(f"- 🟠 **ด่านไฟล์กำพร้าเดินไม่ทั่วสโตร์ — ข้ามด่านนี้รอบนี้** เดินถึง {len(depth)} "
+               f"จาก {len(names)} ไฟล์ (ดัชนีอ่านไม่ได้ หรือรูปแบบลิงก์เปลี่ยนไป) ⇒ ผลกำพร้า"
+               f"รอบนี้จะผิดทั้งแผง จึงไม่ลิสต์ให้")
     n += 1
+else:
+    for o in sorted(nm for nm in names if nm not in depth):
+        out.append(f"- 🔴 `{o}.md` — **ไม่มีลิงก์เส้นไหนจาก `MEMORY.md` เดินมาถึง** "
+                   f"(เซสชันที่ไม่ได้ยิงค้นจะไม่มีทางรู้ว่ามีไฟล์นี้)")
+        n += 1
+    # ไกลเกินสองทอด: ยังหาเจอได้ แต่ต้องเดินผ่านไฟล์ที่ไม่ใช่ดัชนีและไม่ใช่ hub ⇒ อ่อนกว่ากำพร้ามาก
+    for nm in sorted(nm for nm in names if depth.get(nm, 0) >= 3):
+        out.append(f"- 🟡 `{nm}.md` — เดินถึงได้แต่ต้องผ่าน {depth[nm]} ทอดจาก `MEMORY.md` "
+                   f"(ไม่ได้อยู่ในดัชนีและไม่มี hub ไหนชี้ตรง) — **เทียบเอง**")
+        n += 1
 
 with open(report, 'a', encoding='utf-8') as fh:
     fh.write("\n## บรรทัดสรุป (description / hub) และไฟล์กำพร้า\n\n")
