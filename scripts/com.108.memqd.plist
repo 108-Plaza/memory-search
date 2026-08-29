@@ -4,11 +4,14 @@
   memqd — the resident index behind the UserPromptSubmit hook.
 
   This file is the source of truth; the live copy is at
-  ~/Library/LaunchAgents/com.108.memqd.plist. To install or update:
+  ~/Library/LaunchAgents/com.108.memqd.plist. Do not copy it by hand —
+  `scripts/install.sh` writes it, substituting $HOME and the install prefix,
+  and restarts the agent. Paths below are absolute because launchd expands
+  neither ~ nor $HOME.
 
-      cp scripts/com.108.memqd.plist ~/Library/LaunchAgents/
-      launchctl bootout  gui/$UID/com.108.memqd 2>/dev/null
-      launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.108.memqd.plist
+  The binary lives in ~/.local/bin, NOT in target/release. It used to live in
+  target/, and a disk cleanup that removed target/ took the MCP server, the
+  UserPromptSubmit hook and this daemon down together (2026-08-29).
 
   Why an agent at all: before this, the daemon was started by hand. It did not
   survive a reboot, and `memq hook`'s fallback only spawns a replacement on the
@@ -24,7 +27,6 @@
   memory written a moment ago is searchable now. A query that blocks for a
   couple of seconds right after a write is that, not a hang.
 
-  Paths are absolute because launchd expands neither ~ nor $HOME.
 -->
 <plist version="1.0">
 <dict>
@@ -33,7 +35,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search/target/release/memq</string>
+        <string>/Users/yongyutjantaboot/.local/bin/memq</string>
         <string>serve</string>
     </array>
 
@@ -52,7 +54,10 @@
     <key>StandardErrorPath</key>
     <string>/Users/yongyutjantaboot/Library/Logs/memqd.log</string>
 
+    <!-- memqd reads nothing relative to cwd (store and cache paths are built
+         from $HOME), so this deliberately does not point at the checkout: the
+         daemon must not stop booting because the repo moved. -->
     <key>WorkingDirectory</key>
-    <string>/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search</string>
+    <string>/Users/yongyutjantaboot</string>
 </dict>
 </plist>

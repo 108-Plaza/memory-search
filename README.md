@@ -68,8 +68,17 @@ What the indexer expects of that directory:
 
 ### Build & wire up
 
-    cargo build --release
-    claude mcp add --scope user memory-search -- "$PWD/target/release/memory-search"
+    scripts/install.sh
+    claude mcp add --scope user memory-search -- "$HOME/.local/bin/memory-search"
+
+`scripts/install.sh` builds both binaries and installs them into `~/.local/bin`
+(`--prefix` to choose elsewhere), then rewrites and restarts the launchd agent.
+
+⚠️ **Never point the MCP entry, the hook, or the plist at `target/release/`.**
+All three reference the binary by absolute path, so a `cargo clean` or a disk
+sweep breaks retrieval everywhere at once — the next session starts with no
+memory and an ENOENT it cannot fix from inside. Installing out of `target/`
+is what makes the build tree disposable again.
 
 One tool: `memory_search(query, k)` — Thai and English both work.
 Dev query loop: `cargo run --release --bin tryquery`.
@@ -127,26 +136,22 @@ This half is optional — the MCP tool works on its own. Register the hook in
 
     { "hooks": { "UserPromptSubmit": [ { "hooks": [
         { "type": "command",
-          "command": "/path/to/memory-search/target/release/memq hook",
+          "command": "/Users/you/.local/bin/memq hook",
           "timeout": 5 } ] } ] } }
 
-Then install the agent so the daemon survives reboots — started by hand, it did
-not, and the first prompt after every restart silently got no memory:
+The launchd agent that keeps the daemon alive across reboots is installed by
+`scripts/install.sh` — started by hand, it did not survive one, and the first
+prompt after every restart silently got no memory. The script substitutes
+`$HOME` and the install prefix into the plist's absolute paths (launchd expands
+neither `~` nor `$HOME`), so the committed copy works on a machine that is not
+the author's. Check `~/Library/Logs/memqd.log` after it runs.
 
-    cp scripts/com.108.memqd.plist ~/Library/LaunchAgents/
-    launchctl bootout  gui/$UID/com.108.memqd 2>/dev/null
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.108.memqd.plist
-
-⚠️ **Edit the plist's four absolute paths first** (binary, both log paths,
-`WorkingDirectory`) — launchd expands neither `~` nor `$HOME`, so the shipped
-copy points at the author's machine and will fail silently on yours. Check
-`~/Library/Logs/memqd.log` after bootstrapping.
-
-Log: `~/Library/Logs/memqd.log`. After `cargo build --release --bin memq`, restart
-it (`launchctl kickstart -k gui/$UID/com.108.memqd`) — KeepAlive only replaces a
-dead process, it does not notice a new binary. Same for the MCP server, which is
-a per-session child: `pkill -f release/memory-search` and the harness respawns it
-on the new binary within seconds, no app restart.
+Log: `~/Library/Logs/memqd.log`. Re-run `scripts/install.sh` after any change to
+the sources: it restarts memqd for you, because KeepAlive only replaces a *dead*
+process and does not notice a new binary, and it kills the MCP server, which is
+a per-session child the harness respawns on the new binary within seconds — no
+app restart. Both binaries are replaced by rename, so the copy cannot fail with
+ETXTBSY against the running daemon.
 
 Two request modes on the socket, same index:
 
