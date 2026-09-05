@@ -7,10 +7,10 @@
 #   scripts/install.sh --no-build         # install what is already built
 #
 # Why not just point everything at target/release/ (what this repo did until
-# 2026-08-29): three separate things reference the binaries by absolute path —
+# 2026-08-29): four separate things reference the binaries by absolute path —
 # the MCP server entry in ~/.claude.json, the UserPromptSubmit hook in
-# ~/.claude/settings.json, and the launchd plist. When `cargo clean` or a disk
-# sweep removed target/, all three broke at once and the next session started
+# ~/.claude/settings.json, JetBrains Air's mcp.json, and the launchd plist. When `cargo clean` or a disk
+# sweep removed target/, all four broke at once and the next session started
 # with no memory at all and an ENOENT it could not fix by itself.
 #
 # The copy is a rename, not an overwrite: memqd is usually running from the file
@@ -77,13 +77,11 @@ echo "==> memqd restarted on the new binary"
 pkill -f "bin/memory-search" 2>/dev/null || true
 
 # Anything still pointing into target/ will break the next time it is cleaned.
-STALE=0
-for f in "$HOME/.claude.json" "$HOME/.claude/settings.json"; do
-    if [ -f "$f" ] && grep -q "memory-search/target/release" "$f"; then
-        echo "!!  $f still points into target/release — repoint it at $PREFIX" >&2
-        STALE=1
-    fi
-done
+if ! scripts/check-stale-paths.sh "$PREFIX"; then
+    STALE=1
+else
+    STALE=0
+fi
 
 echo
 if [ "$STALE" -eq 0 ]; then
