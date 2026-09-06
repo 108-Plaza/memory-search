@@ -74,11 +74,12 @@ What the indexer expects of that directory:
 `scripts/install.sh` builds both binaries and installs them into `~/.local/bin`
 (`--prefix` to choose elsewhere), then rewrites and restarts the launchd agent.
 
-⚠️ **Never point the MCP entry, the hook, or the plist at `target/release/`.**
-All three reference the binary by absolute path, so a `cargo clean` or a disk
-sweep breaks retrieval everywhere at once — the next session starts with no
-memory and an ENOENT it cannot fix from inside. Installing out of `target/`
-is what makes the build tree disposable again.
+⚠️ **Never point the MCP entries, the hook, or the plist at `target/release/`.**
+All four reference the binary by absolute path (Claude Code's `~/.claude.json`,
+`~/.claude/settings.json`, JetBrains Air's `mcp.json`, and the launchd plist), so
+a `cargo clean` or a disk sweep breaks retrieval everywhere at once — the next
+session starts with no memory and an ENOENT it cannot fix from inside.
+Installing out of `target/` is what makes the build tree disposable again.
 
 One tool: `memory_search(query, k)` — Thai and English both work.
 Dev query loop: `cargo run --release --bin tryquery`.
