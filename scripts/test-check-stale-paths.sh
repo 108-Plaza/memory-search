@@ -33,14 +33,14 @@ setup_empty_home() {
 }
 
 setup_claude_json_stale() {
-    printf '{"mcpServers":{"memory-search":{"command":"/opt/memory-search/target/release/memqd"}}}\n' \
-        >"$1/.claude.json"
+    printf '{"mcpServers":{"memory-search":{"command":"/opt/%s/memqd"}}}\n' \
+        "$STALE_NEEDLE" >"$1/.claude.json"
 }
 
 setup_air_stale() {
     mkdir -p "$1/Library/Application Support/JetBrains/Air"
-    printf '{"mcpServers":{"memory-search":{"command":"/opt/memory-search/target/release/memqd"}}}\n' \
-        >"$1/Library/Application Support/JetBrains/Air/mcp.json"
+    printf '{"mcpServers":{"memory-search":{"command":"/opt/%s/memqd"}}}\n' \
+        "$STALE_NEEDLE" >"$1/Library/Application Support/JetBrains/Air/mcp.json"
 }
 
 setup_air_clean() {
