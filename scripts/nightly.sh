@@ -75,10 +75,14 @@ STAGE="$OUT/$STAMP-accept"
 mkdir -p "$STAGE"
 T0=$(date +%s)
 # Paths uncommitted before this run are not this job's to commit (#23 §6).
-PENDING=$(git -C "$STORE" status --porcelain | cut -c4-)
+# -uall: a pending untracked directory must list its files, not just `dir/`.
+PENDING=$(git -C "$STORE" status --porcelain -uall | cut -c4-)
 PROMPT="Steps 1 and 2 of the pipeline below have ALREADY RUN in this round (step 1 exit $RC1, step 2 exit $RC2; their output is in $LOG and the newest files in $OUT). Do NOT run them again. Do only step 3, then write the report as the prompt describes.
 
-Your tools are exactly: Read, Glob and Grep (anywhere, including the store); memory_search; shell commands starting with 'gh pr view', 'gh api repos/', 'git -C $STORE log', 'git -C $STORE status' or 'git -C $STORE show', and 'rm -f $OUT/'; and Write/Edit inside $STAGE and on $OUT/*.md. Anything else is denied and fails the run, so do not try cat, ls, cp, ssh or other shell commands: use Read, Glob and Write instead. An item that needs anything else stays in the proposal with that reason.
+Your tools are exactly: Read, Glob and Grep (anywhere, including the store); memory_search; the shell commands 'gh pr view …', and '$DIR/scripts/gh-get.sh <one GitHub API endpoint>' (GET only, in place of 'gh api'); and Write/Edit inside $STAGE and on $OUT/*.md. Anything else is denied and fails the run, so do not try cat, ls, cp, rm, git, ssh or other shell commands: use Read, Glob and Write instead. To delete a fully accepted proposal, overwrite it with empty content; the script removes empty proposals. An item that needs anything else stays in the proposal with that reason.
+
+The store's recent history, read for you before this run (you have no git):
+$(git -C "$STORE" log -15 --format='%h %cI %s')
 
 You cannot write the store at $STORE and must not try, with any tool. Instead, for every store file you would add or change, write its COMPLETE new content to $STAGE/<its path relative to the store> (to change an existing file, read it from the store and write the whole edited copy). Write a one-line commit message to $STAGE/COMMIT_MSG. The calling script then scans those files, copies them into the store, commits exactly those paths and pushes, so skip the commit/push sub-step. Never stage a deletion.
 
@@ -91,12 +95,14 @@ $(cat "$PROMPT_FILE")"
 JSON=$(mktemp)
 (cd "$DIR" && claude -p "$PROMPT" --model "$MODEL" --max-turns 80 --output-format json \
   --setting-sources project --permission-mode dontAsk \
-  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STAGE/**),Edit(/$OUT/*.md),Bash(rm -f $OUT/*),Bash(gh pr view:*),Bash(gh api repos/*),Bash(git -C $STORE log:*),Bash(git -C $STORE status:*),Bash(git -C $STORE show:*)") >"$JSON" 2>>"$LOG"
+  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STAGE/**),Edit(/$OUT/*.md),Bash(gh pr view:*),Bash($DIR/scripts/gh-get.sh:*)") >"$JSON" 2>>"$LOG"
 RC3=$?
 # Exit 0 is not proof (mine-nightly.sh records a refusal that exited 0): a denied call fails the run.
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result","")); n=d.get("permission_denials") or []; [print("DENIED:", x["tool_name"], json.dumps(x["tool_input"])[:300]) for x in n]; sys.exit(2 if n else 0)' "$JSON" >>"$LOG" 2>&1 \
   || { say "step 3: a tool call was denied or its output was unreadable"; RC3=1; }
 rm -f "$JSON"
+# No rm rule for step 3: `Bash(rm -f $OUT/*)` also matched `rm -f $OUT/a.md <any file>`.
+find "$OUT" -maxdepth 1 -name '*.md' -size 0 -delete
 
 say "step 3: apply $STAGE to the store"
 APPLIED=()
@@ -104,7 +110,7 @@ while IFS= read -r f; do
   rel=${f#"$STAGE"/}
   [ "$rel" = COMMIT_MSG ] && continue
   case "$rel" in
-    *..*|*[!A-Za-z0-9._/-]*|*[!d]|*[!m]d|*[!.]md) say "refused $rel: not a plain .md store path"; RC3=1; continue ;;
+    *..*|.git/*|*/.git/*|*[!A-Za-z0-9._/-]*|*[!d]|*[!m]d|*[!.]md) say "refused $rel: not a plain .md store path"; RC3=1; continue ;;
   esac
   if printf '%s\n' "$PENDING" | grep -qFx "$rel"; then
     say "refused $rel: it was pending before this run and is not approved"; RC3=1; continue
