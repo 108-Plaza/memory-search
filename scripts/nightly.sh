@@ -10,7 +10,8 @@
 #
 #   step 1  scripts/mine-nightly.sh   new facts from transcripts -> proposals/
 #   step 2  scripts/verify-stale.sh   is the old memory still true -> proposals/*-stale.md
-#   step 3  headless claude           accept what it can re-verify into the store, commit, push
+#   step 3  headless claude           re-verify proposals, stage accepted files -> proposals/*-accept/
+#           this script               copy staged files into the store, commit them by path, push
 #
 # Steps 1 and 2 are scripts and run here. Step 3 needs judgement, so it is a
 # `claude -p` run with the same prompt the Desktop task used (its SKILL.md, kept
@@ -64,25 +65,73 @@ if [ ! -r "$PROMPT_FILE" ]; then
   exit 1
 fi
 
-say "step 3: accept into the store (claude -p, model $MODEL)"
-STORE="$HOME/.claude/shared-memory/pos108"
+say "step 3: re-verify and stage (claude -p, model $MODEL)"
+STORE="${MEMQ_STORE:-$HOME/.claude/shared-memory/pos108}"
+# Step 3 cannot write the store itself: ~/.claude is a protected path, and nothing short of a
+# broad grant lets a headless run write there (2026-10-21: every store write was denied, and
+# the run still exited 0). So step 3 writes full copies of what it accepts into STAGE, and
+# this script, not the model, copies them into the store and commits exactly those paths.
+STAGE="$OUT/$STAMP-accept"
+mkdir -p "$STAGE"
+T0=$(date +%s)
 # Paths uncommitted before this run are not this job's to commit (#23 §6).
-PENDING=$(git -C "$STORE" status --porcelain)
-HEAD0=$(git -C "$STORE" rev-parse HEAD)
+PENDING=$(git -C "$STORE" status --porcelain | cut -c4-)
 PROMPT="Steps 1 and 2 of the pipeline below have ALREADY RUN in this round (step 1 exit $RC1, step 2 exit $RC2; their output is in $LOG and the newest files in $OUT). Do NOT run them again. Do only step 3, then write the report as the prompt describes.
 
-These store paths were ALREADY uncommitted before this run and the owner has not approved them. Never edit, add, commit or delete them; stage files by explicit path only, never 'git add -A' or '.'. If MEMORY.md is one of them, link new memories from a hub instead:
+You cannot write the store at $STORE and must not try, with any tool. Instead, for every store file you would add or change, write its COMPLETE new content to $STAGE/<its path relative to the store> (to change an existing file, read it from the store and write the whole edited copy). Write a one-line commit message to $STAGE/COMMIT_MSG. The calling script then scans those files, copies them into the store, commits exactly those paths and pushes, so skip the commit/push sub-step. Never stage a deletion.
+
+These store paths were ALREADY uncommitted before this run and the owner has not approved them. Never stage them. If MEMORY.md is one of them, link new memories from a hub instead:
 ${PENDING:-(none)}
 
 $(cat "$PROMPT_FILE")"
 # Headless, so nothing can be approved: list exactly what step 3 may do, and load no user
 # settings (their allow list includes merging PRs, which a run fed by transcripts must not inherit).
-(cd "$DIR" && claude -p "$PROMPT" --model "$MODEL" --max-turns 80 \
+JSON=$(mktemp)
+(cd "$DIR" && claude -p "$PROMPT" --model "$MODEL" --max-turns 80 --output-format json \
   --setting-sources project --permission-mode dontAsk \
-  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STORE/**),Edit(/$OUT/**),Bash(git -C $STORE:*),Bash(gh pr view:*),Bash(gh api repos/*),Bash(rm -f $OUT/*)") >>"$LOG" 2>&1
+  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STAGE/**),Edit(/$OUT/*.md),Bash(rm -f $OUT/*),Bash(gh pr view:*),Bash(gh api repos/*)") >"$JSON" 2>>"$LOG"
 RC3=$?
-say "step 3 exit $RC3; store: $(git -C "$STORE" rev-list --count "$HEAD0"..HEAD) new commit(s), $(git -C "$STORE" status --porcelain | grep -c .) uncommitted path(s) (was $(printf '%s' "$PENDING" | grep -c .))"
-LEAKED=$(git -C "$STORE" diff --name-only "$HEAD0" HEAD | grep -Fx -f <(printf '%s\n' "$PENDING" | cut -c4- | grep .))
-[ -n "$LEAKED" ] && { say "step 3 committed paths that were pending before it ran: $LEAKED"; RC3=1; }
+# Exit 0 is not proof (mine-nightly.sh records a refusal that exited 0): a denied call fails the run.
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result","")); n=d.get("permission_denials") or []; [print("DENIED:", x["tool_name"], json.dumps(x["tool_input"])[:300]) for x in n]; sys.exit(2 if n else 0)' "$JSON" >>"$LOG" 2>&1 \
+  || { say "step 3: a tool call was denied or its output was unreadable"; RC3=1; }
+rm -f "$JSON"
+
+say "step 3: apply $STAGE to the store"
+APPLIED=()
+while IFS= read -r f; do
+  rel=${f#"$STAGE"/}
+  [ "$rel" = COMMIT_MSG ] && continue
+  case "$rel" in
+    *..*|*[!A-Za-z0-9._/-]*|*[!d]|*[!m]d|*[!.]md) say "refused $rel: not a plain .md store path"; RC3=1; continue ;;
+  esac
+  if printf '%s\n' "$PENDING" | grep -qFx "$rel"; then
+    say "refused $rel: it was pending before this run and is not approved"; RC3=1; continue
+  fi
+  cmp -s "$f" "$STORE/$rel" && continue
+  if [ -e "$STORE/$rel" ] && [ "$(stat -f %m "$STORE/$rel")" -ge "$T0" ]; then
+    say "refused $rel: someone changed it in the store during this run"; RC3=1; continue
+  fi
+  if grep -Eq 'BEGIN [A-Z ]*PRIVATE KEY|ghp_[A-Za-z0-9]{20}|github_pat_|AKIA[0-9A-Z]{16}|xox[abpr]-|sk-ant-' "$f"; then
+    say "refused $rel: it looks like it holds a secret"; RC3=1; continue
+  fi
+  mkdir -p "$(dirname "$STORE/$rel")" && cp "$f" "$STORE/$rel" && git -C "$STORE" add -- "$rel" \
+    && APPLIED+=("$rel") || { say "could not apply $rel"; RC3=1; }
+done < <(find "$STAGE" -type f | sort)
+
+if [ ${#APPLIED[@]} -gt 0 ]; then
+  MSG=$(head -1 "$STAGE/COMMIT_MSG" 2>/dev/null)
+  # Commit only these paths: anything else already in the store's index is not this job's.
+  git -C "$STORE" commit -q -m "${MSG:-store: nightly accept $STAMP}" -m "Applied by scripts/nightly.sh from proposals/$STAMP-accept." -- "${APPLIED[@]}" >>"$LOG" 2>&1 \
+    || { say "commit failed"; RC3=1; }
+fi
+git -C "$STORE" fetch -q origin 2>>"$LOG"
+AHEAD=$(git -C "$STORE" rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+BEHIND=$(git -C "$STORE" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo "?")
+if [ "$AHEAD" != 0 ] && [ "$BEHIND" = 0 ]; then
+  git -C "$STORE" push -q origin HEAD 2>>"$LOG" && AHEAD=0 || say "push failed"
+fi
+[ "$AHEAD" != 0 ] && { say "store: $AHEAD commit(s) not pushed ($BEHIND behind origin: never merged here, a person decides)"; RC3=1; }
+say "step 3 done: ${#APPLIED[@]} file(s) committed, exit $RC3; $(printf '%s' "$PENDING" | grep -c .) path(s) pending from before stay untouched"
+[ "$RC3" -eq 0 ] && rm -rf "$STAGE"
 
 exit $(( RC1 | RC2 | RC3 ))
