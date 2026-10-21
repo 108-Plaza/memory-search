@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The nightly memory pipeline: scripts/nightly.sh at 03:00 every day.
+
+  This file is the source of truth; the live copy is at
+  ~/Library/LaunchAgents/com.108.memory-nightly.plist. Do not copy it by hand:
+  `scripts/install.sh` writes it, substituting $HOME, and reloads the agent.
+  Paths are absolute because launchd expands neither ~ nor $HOME.
+
+  It replaces the Claude Desktop scheduled task "mine-memory-nightly", which
+  dropped out of the Desktop scheduler's registry and stopped running (#23).
+  StartCalendarInterval fires a run missed while the machine slept on the next
+  wake, so a closed laptop delays the run instead of skipping it.
+
+  It is a LaunchAgent, so it runs only while this user is logged in: step 3
+  needs the login keychain for `gh` and for the claude CLI's sign-in.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.108.memory-nightly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/yongyutjantaboot/IdeaProjects/108-Ting-Ecosystem/platform/memory-search/scripts/nightly.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- launchd starts jobs with a bare PATH: no ~/.local/bin (claude, memq)
+         and no /opt/homebrew/bin (gh). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/yongyutjantaboot/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/yongyutjantaboot/Library/Logs/memory-nightly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yongyutjantaboot/Library/Logs/memory-nightly.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/yongyutjantaboot</string>
+</dict>
+</plist>

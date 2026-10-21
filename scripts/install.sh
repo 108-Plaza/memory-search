@@ -72,6 +72,22 @@ done
 launchctl bootstrap gui/"$UID" "$PLIST"
 echo "==> memqd restarted on the new binary"
 
+# The nightly pipeline (scripts/nightly.sh at 03:00, #23). It runs the script
+# from this checkout, so the plist gets this checkout's path, not the author's.
+NIGHTLY="$HOME/Library/LaunchAgents/com.108.memory-nightly.plist"
+sed -e "s#<string>[^<]*/scripts/nightly.sh</string>#<string>$PWD/scripts/nightly.sh</string>#" \
+    -e "s#/Users/yongyutjantaboot#$HOME#g" \
+    -e "s#<string>[^<]*/\.local/bin:#<string>$PREFIX:#" \
+    scripts/com.108.memory-nightly.plist > "$NIGHTLY"
+echo "==> wrote $NIGHTLY"
+launchctl bootout gui/"$UID"/com.108.memory-nightly 2>/dev/null || true
+for _ in $(seq 1 25); do
+    launchctl print gui/"$UID"/com.108.memory-nightly >/dev/null 2>&1 || break
+    sleep 0.2
+done
+launchctl bootstrap gui/"$UID" "$NIGHTLY"
+echo "==> nightly pipeline scheduled (03:00 daily)"
+
 # The MCP server is a per-session child of the harness — kill it and the
 # harness respawns it on the new binary within seconds, no app restart.
 pkill -f "bin/memory-search" 2>/dev/null || true
