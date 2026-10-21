@@ -126,10 +126,14 @@ FRESH="-mmin +30"
 
 # shellcheck disable=SC2086  # ตั้งใจไม่ quote $NEWER/$FRESH (ว่าง = ไม่มี filter)
 # head ปิด pipe ก่อน find จบ → SIGPIPE + pipefail = exit 141; ครอบด้วย subshell+true
+# ⚠️ เอา 5 ไฟล์ที่ **เก่าสุด** แล้วขยับ watermark ไปแค่ mtime ของไฟล์ล่าสุดในชุดนั้น (บรรทัด touch -r ข้างล่าง)
+# เดิม head -5 ตามลำดับ find แล้ว `touch "$MARK"` = เวลาปัจจุบัน ⇒ ที่เกิน 5 หายถาวร
+# (2026-10-21: ค้าง 136 ไฟล์หลังงานหยุดไป 50 วัน รอบแรกจะเหลือขุดได้ 5 ทิ้ง 131 — #23)
 FILES=$( { for d in "${DIRS[@]}"; do
   find "$PROJ/$d" -maxdepth 1 -name '*.jsonl' $NEWER $FRESH \
-    -size +${MIN_BYTES}c -size -${MAX_BYTES}c 2>/dev/null
-done; } | head -5 || true)
+    -size +${MIN_BYTES}c -size -${MAX_BYTES}c -exec stat -f '%m %N' {} + 2>/dev/null
+done; } | sort -n | head -5 | cut -d' ' -f2- || true)
+LAST=$(echo "$FILES" | tail -1)
 
 if [ -z "$FILES" ]; then
   echo "ไม่มี transcript ใหม่ให้ขุด"
@@ -203,5 +207,5 @@ if [ ! -s "$OUT/$STAMP.md" ]; then
   exit 1
 fi
 
-touch "$MARK"
+touch -r "$LAST" "$MARK"
 echo "เสร็จ → $OUT/$STAMP.md  (รีวิวแล้วค่อยย้ายเข้ากองกลางเอง)"
