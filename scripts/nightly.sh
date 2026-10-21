@@ -78,6 +78,8 @@ T0=$(date +%s)
 PENDING=$(git -C "$STORE" status --porcelain | cut -c4-)
 PROMPT="Steps 1 and 2 of the pipeline below have ALREADY RUN in this round (step 1 exit $RC1, step 2 exit $RC2; their output is in $LOG and the newest files in $OUT). Do NOT run them again. Do only step 3, then write the report as the prompt describes.
 
+Your tools are exactly: Read, Glob and Grep (anywhere, including the store); memory_search; shell commands starting with 'gh pr view', 'gh api repos/', 'git -C $STORE log', 'git -C $STORE status' or 'git -C $STORE show', and 'rm -f $OUT/'; and Write/Edit inside $STAGE and on $OUT/*.md. Anything else is denied and fails the run, so do not try cat, ls, cp, ssh or other shell commands: use Read, Glob and Write instead. An item that needs anything else stays in the proposal with that reason.
+
 You cannot write the store at $STORE and must not try, with any tool. Instead, for every store file you would add or change, write its COMPLETE new content to $STAGE/<its path relative to the store> (to change an existing file, read it from the store and write the whole edited copy). Write a one-line commit message to $STAGE/COMMIT_MSG. The calling script then scans those files, copies them into the store, commits exactly those paths and pushes, so skip the commit/push sub-step. Never stage a deletion.
 
 These store paths were ALREADY uncommitted before this run and the owner has not approved them. Never stage them. If MEMORY.md is one of them, link new memories from a hub instead:
@@ -89,7 +91,7 @@ $(cat "$PROMPT_FILE")"
 JSON=$(mktemp)
 (cd "$DIR" && claude -p "$PROMPT" --model "$MODEL" --max-turns 80 --output-format json \
   --setting-sources project --permission-mode dontAsk \
-  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STAGE/**),Edit(/$OUT/*.md),Bash(rm -f $OUT/*),Bash(gh pr view:*),Bash(gh api repos/*)") >"$JSON" 2>>"$LOG"
+  --allowedTools "Read,Glob,Grep,mcp__memory-search__memory_search,Edit(/$STAGE/**),Edit(/$OUT/*.md),Bash(rm -f $OUT/*),Bash(gh pr view:*),Bash(gh api repos/*),Bash(git -C $STORE log:*),Bash(git -C $STORE status:*),Bash(git -C $STORE show:*)") >"$JSON" 2>>"$LOG"
 RC3=$?
 # Exit 0 is not proof (mine-nightly.sh records a refusal that exited 0): a denied call fails the run.
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result","")); n=d.get("permission_denials") or []; [print("DENIED:", x["tool_name"], json.dumps(x["tool_input"])[:300]) for x in n]; sys.exit(2 if n else 0)' "$JSON" >>"$LOG" 2>&1 \
